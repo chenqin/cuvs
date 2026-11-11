@@ -1501,6 +1501,11 @@ void convert_c_search_params(cuvsCagraSearchParams params,
   out->persistent            = params.persistent;
   out->persistent_lifetime   = params.persistent_lifetime;
   out->persistent_device_usage = params.persistent_device_usage;
+  // A zeroed C struct asks for the automatic rate, as before these fields existed.
+  out->filtering_rate   = params.filtering_rate > 0.0f ? params.filtering_rate : -1.0f;
+  out->filter_expansion =
+    static_cast<cuvs::neighbors::cagra::filter_expansion_mode>(params.filter_expansion);
+  out->query_bitsets = reinterpret_cast<const uint32_t* const*>(params.query_bitsets);
 }
 
 void* cagra_c_api_index_ptr(cuvsCagraIndex const* idx)
@@ -2423,6 +2428,9 @@ extern "C" cuvsError_t cuvsCagraSearchParamsCreate(cuvsCagraSearchParams_t* para
       .persistent              = false,
       .persistent_lifetime     = 2,
       .persistent_device_usage = 1.0,
+      .filtering_rate          = 0.0,
+      .filter_expansion        = CUVS_CAGRA_FILTER_SCORE_ALL,
+      .query_bitsets           = 0,
     };
   });
 }

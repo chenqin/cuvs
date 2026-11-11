@@ -30,6 +30,44 @@
 
 namespace cuvs::neighbors::cagra::detail::multi_cta_search {
 
+// What the MULTI_CTA kernel may do with a filter beyond calling the linked sample_filter (see
+// cagra_sample_filter_flags): read a bitset's words itself, take one bitset per query, and walk
+// through passing nodes only.
+template <typename SourceIndexT, typename SampleFilterT>
+void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
+                                const SampleFilterT& sample_filter,
+                                const search_params& ps)
+{
+  if constexpr (requires {
+                  sample_filter.filter;
+                  sample_filter.offset;
+                }) {
+    using inner_t = std::decay_t<decltype(sample_filter.filter)>;
+    if constexpr (is_bitset_filter<inner_t>::value) {
+      const auto view = sample_filter.filter.view();
+      // bitset_view::test() is `(word[i / 32] >> (i % 32)) & 1` for 32-bit words that were not
+      // repacked from another word size.
+      const bool plain_words = sizeof(*view.data()) == sizeof(std::uint32_t) &&
+                               (view.get_original_nbits() == 0 || view.get_original_nbits() == 32);
+      if (ps.query_bitsets != nullptr) {
+        RAFT_EXPECTS(plain_words, "query_bitsets needs a bitset_filter of 32-bit words");
+        payload.filter_data = const_cast<void*>(static_cast<const void*>(ps.query_bitsets));
+        payload.flags |= kCagraFilterQueryBitsets;
+      } else if (plain_words && payload.filter_data != nullptr && view.data() != nullptr) {
+        payload.flags |= kCagraFilterBitsetWords;
+      }
+    } else {
+      RAFT_EXPECTS(ps.query_bitsets == nullptr, "query_bitsets needs a bitset_filter");
+    }
+    if (ps.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP &&
+        payload.filter_data != nullptr) {
+      payload.flags |= kCagraFilterPassingTwoHop;
+    }
+  } else {
+    RAFT_EXPECTS(ps.query_bitsets == nullptr, "query_bitsets needs a bitset_filter");
+  }
+}
+
 template <typename DataT,
           typename IndexT,
           typename DistanceT,
@@ -58,7 +96,8 @@ void select_and_run(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dat
                     SampleFilterT sample_filter,
                     cudaStream_t stream)
 {
-  const auto filter_payload      = extract_cagra_sample_filter<SourceIndexT>(sample_filter, stream);
+  auto filter_payload = extract_cagra_sample_filter<SourceIndexT>(sample_filter, stream);
+  set_multi_cta_filter_flags(filter_payload, sample_filter, ps);
   const uint32_t query_id_offset = filter_payload.query_id_offset;
 
   std::shared_ptr<rtcx::algorithm_launcher> launcher =

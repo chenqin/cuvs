@@ -446,6 +446,30 @@ enum cuvsCagraSearchAlgo {
 enum cuvsCagraHashMode { HASH = 0, SMALL = 1, AUTO_HASH = 100 };
 
 /**
+ * @brief Defined when cuvsCagraSearchParams has `filtering_rate`, `filter_expansion` and
+ * `query_bitsets`.
+ */
+#define CUVS_CAGRA_HAS_FILTER_EXPANSION 1
+
+/**
+ * @brief How a MULTI_CTA search walks the graph when a filter is given
+ */
+enum cuvsCagraFilterExpansion {
+  /**
+   * Every neighbor of an expanded node is scored and may be expanded in turn, whether or not it
+   * passes the filter; rejected nodes are dropped from the results.
+   */
+  CUVS_CAGRA_FILTER_SCORE_ALL = 0,
+  /**
+   * Only nodes that pass the filter are scored, kept and expanded. A rejected neighbor is not
+   * scored: its own neighbors are examined instead. The search starts from random nodes that
+   * pass the filter (`num_random_samplings` of them per start slot, the nearest kept). For
+   * filters that reject most of the index.
+   */
+  CUVS_CAGRA_FILTER_PASSING_TWO_HOP = 1
+};
+
+/**
  * @brief Supplemental parameters to search CAGRA index
  *
  */
@@ -515,6 +539,27 @@ struct cuvsCagraSearchParams {
    * impact on the throughput.
    */
   float persistent_device_usage;
+
+  /**
+   * Fraction of the index's rows the filter removes, greater than 0 and less than 1. 0 (the
+   * default): computed from the filter by each search that needs it, which reads the whole
+   * bitset and waits for the result.
+   */
+  float filtering_rate;
+
+  /** How a filtered MULTI_CTA search walks the graph. Other algorithms ignore it. */
+  enum cuvsCagraFilterExpansion filter_expansion;
+
+  /**
+   * MULTI_CTA with a BITSET filter: when not 0, the device address of an array with one pointer
+   * per query, each to the 32-bit words of that query's own bitset over the index's rows (bit
+   * `i % 32` of word `i / 32` is set when row `i` passes), on the device being searched. The
+   * filter's own bitset is then not read, so queries with different filters can share one
+   * search call. `filtering_rate` must be given unless `filter_expansion` is
+   * CUVS_CAGRA_FILTER_PASSING_TWO_HOP. The array and the bitsets must stay valid until the
+   * search's work on the stream has finished.
+   */
+  uintptr_t query_bitsets;
 };
 
 typedef struct cuvsCagraSearchParams* cuvsCagraSearchParams_t;

@@ -53,6 +53,32 @@ enum class hash_mode { HASH = 0, SMALL = 1, AUTO = 100 };
 
 enum class internal_dtype { F16 = 0, E5M2 = 1 };
 
+/**
+ * How a MULTI_CTA search walks the graph when a sample filter is given.
+ */
+enum class filter_expansion_mode {
+  /**
+   * Every neighbor of an expanded node is scored and may be expanded in turn, whether or not it
+   * passes the filter; rejected nodes are dropped from the results. The candidate list is
+   * lengthened by the filtering rate to make up for the rejected nodes it holds.
+   */
+  SCORE_ALL = 0,
+  /**
+   * Only nodes that pass the filter are scored, kept and expanded. A rejected neighbor is not
+   * scored: its own neighbors are examined instead, so a node's children are the passing nodes
+   * within two hops. The search starts from random nodes that pass the filter
+   * (`num_random_samplings` of them per start slot, the nearest kept), and the candidate list is
+   * not lengthened by the filtering rate, which is not needed and not computed.
+   *
+   * This suits filters that reject most of the index, where SCORE_ALL spends nearly all its
+   * distance computations on nodes it then drops, and is most effective when the rows a filter
+   * passes are near each other. With too few passing rows for any to lie within two hops of one
+   * another (under roughly one row in the square of the graph degree), the walk cannot leave its
+   * start nodes; scan the passing rows instead.
+   */
+  PASSING_TWO_HOP = 1
+};
+
 struct search_params : cuvs::neighbors::search_params {
   /** Maximum number of queries to search at the same time (batch size). Auto select when 0.*/
   size_t max_queries = 0;
@@ -129,6 +155,20 @@ struct search_params : cuvs::neighbors::search_params {
    * inferred from the source string.
    */
   float filtering_rate = -1.0;
+
+  /** How a filtered MULTI_CTA search walks the graph. Other algorithms ignore it. */
+  filter_expansion_mode filter_expansion = filter_expansion_mode::SCORE_ALL;
+
+  /**
+   * MULTI_CTA with a `filtering::bitset_filter`: when not null, a device array with one pointer
+   * per query, each to the 32-bit words of that query's own bitset over the index's rows (bit
+   * `i % 32` of word `i / 32` is set when row `i` passes), on the device being searched. The
+   * bitset of the filter object is then not read, so queries with different filters can share one
+   * search call. `filtering_rate` must be given unless `filter_expansion` is PASSING_TWO_HOP,
+   * which does not use it. The array and the bitsets must stay valid until the search's work on
+   * the stream has finished.
+   */
+  const uint32_t* const* query_bitsets = nullptr;
 
   /** Data type of the query vector and codebook table on shared memory. Currently, only VPQ
    * supports FP8. **/

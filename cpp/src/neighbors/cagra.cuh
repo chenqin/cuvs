@@ -473,8 +473,15 @@ void search(raft::resources const& res,
         sample_filter_ref);
     search_params params_copy = params;
     if (params.filtering_rate < 0.0) {
-      params_copy.filtering_rate = bitset_filtering_rate(
-        res, {static_cast<int64_t>(idx.dataset().n_rows())}, {sample_filter.bitset_view_});
+      if (params.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
+        // The rate only lengthens the SCORE_ALL candidate list: do not count the bitset for it.
+        params_copy.filtering_rate = 0.0;
+      } else {
+        RAFT_EXPECTS(params.query_bitsets == nullptr,
+                     "search_params::filtering_rate must be given with query_bitsets");
+        params_copy.filtering_rate = bitset_filtering_rate(
+          res, {static_cast<int64_t>(idx.dataset().n_rows())}, {sample_filter.bitset_view_});
+      }
     }
     auto sample_filter_copy = sample_filter;
     return search_with_filtering<T, IdxT, decltype(sample_filter_copy), OutputIdxT, DatasetViewT>(

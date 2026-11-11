@@ -136,6 +136,9 @@ struct search
       sizeof(INDEX_T) * hashmap::get_size(small_hash_bitlen) +  // local_visited_hashmap_ptr
       sizeof(INDEX_T) * search_width +                          // parent_indices_buffer
       sizeof(int);                                              // result_position
+    if (this->filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
+      smem_size += sizeof(INDEX_T) * graph_degree;  // the expanded node's rejected neighbors
+    }
     RAFT_LOG_DEBUG("# smem_size: %u", smem_size);
 
     //

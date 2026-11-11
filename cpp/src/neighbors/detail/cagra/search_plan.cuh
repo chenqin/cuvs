@@ -199,7 +199,10 @@ struct search_plan_impl : public search_plan_impl_base {
 
   void adjust_search_params()
   {
-    if (algo == search_algo::MULTI_CTA && (0.0 < filtering_rate && filtering_rate < 1.0)) {
+    // A PASSING_TWO_HOP list holds no rejected nodes to make up for.
+    if (algo == search_algo::MULTI_CTA &&
+        filter_expansion != filter_expansion_mode::PASSING_TWO_HOP &&
+        (0.0 < filtering_rate && filtering_rate < 1.0)) {
       size_t adjusted_itopk_size =
         (size_t)((float)topk / (1.0 - filtering_rate) +
                  (float)(itopk_size - topk) / std::sqrt(1.0 - filtering_rate));
@@ -274,7 +277,12 @@ struct search_plan_impl : public search_plan_impl_base {
       // table that each CTA has in the shared memory. This hash table is not
       // shared among CTAs. This hash table is reset and restored in each iteration.
       //
-      const uint32_t max_visited_nodes       = mc_itopk_size + (graph_degree * 2);
+      // A PASSING_TWO_HOP expansion also registers the second-hop nodes that pass: at most 256
+      // graph entries are examined between two looks at the child buffer, of which a share
+      // passes while the buffer is not yet full.
+      const uint32_t max_visited_nodes =
+        mc_itopk_size + (graph_degree * 2) +
+        (filter_expansion == filter_expansion_mode::PASSING_TWO_HOP ? 128 : 0);
       constexpr size_t max_small_hash_bitlen = 14;  // 16K
       small_hash_bitlen                      = 8;   // 256
       // Stop at the supported maximum rather than growing without bound: hashmap::get_size()
