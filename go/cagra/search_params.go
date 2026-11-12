@@ -31,6 +31,20 @@ const (
 	HashmapModeAuto
 )
 
+// How a MULTI_CTA search walks the graph when a filter is given
+type FilterExpansion int
+
+const (
+	// Every neighbor of an expanded node is scored and may be expanded in turn, whether or not it
+	// passes the filter; rejected nodes are dropped from the results. This is the default.
+	FilterExpansionScoreAll FilterExpansion = iota
+	// Only nodes that pass the filter are scored, kept and expanded. A rejected neighbor is not
+	// scored: its own neighbors are examined instead. The search starts from random nodes that
+	// pass the filter (num_random_samplings of them per start slot, the nearest kept).
+	// For filters that reject most of the index.
+	FilterExpansionPassingTwoHop
+)
+
 // Creates a new SearchParams
 func CreateSearchParams() (*SearchParams, error) {
 	var params C.cuvsCagraSearchParams_t
@@ -150,6 +164,49 @@ func (p *SearchParams) SetNumRandomSamplings(num_random_samplings uint32) (*Sear
 // Bit mask used for initial random seed node selection.
 func (p *SearchParams) SetRandXorMask(rand_xor_mask uint64) (*SearchParams, error) {
 	p.params.rand_xor_mask = C.uint64_t(rand_xor_mask)
+	return p, nil
+}
+
+// Fraction of the index's rows the filter removes. More than 0, less than 1.
+// When 0 (the default), it is computed from the filter by each search that needs it,
+// which reads the whole bitset and waits for the result.
+func (p *SearchParams) SetFilteringRate(filtering_rate float32) (*SearchParams, error) {
+	p.params.filtering_rate = C.float(filtering_rate)
+	return p, nil
+}
+
+// How a filtered MULTI_CTA search walks the graph. With FilterExpansionPassingTwoHop,
+// SearchAlgoAuto selects MULTI_CTA. Other algorithms ignore it.
+func (p *SearchParams) SetFilterExpansion(filter_expansion FilterExpansion) (*SearchParams, error) {
+	CFilterExpansion := C.CUVS_CAGRA_FILTER_SCORE_ALL
+
+	switch filter_expansion {
+	case FilterExpansionScoreAll:
+		CFilterExpansion = C.CUVS_CAGRA_FILTER_SCORE_ALL
+	case FilterExpansionPassingTwoHop:
+		CFilterExpansion = C.CUVS_CAGRA_FILTER_PASSING_TWO_HOP
+	default:
+		return nil, errors.New("unsupported filter_expansion")
+	}
+
+	p.params.filter_expansion = uint32(CFilterExpansion)
+
+	return p, nil
+}
+
+// One bitset per query for a filtered MULTI_CTA search. No per-query bitsets when 0.
+// Otherwise the device address of an array with one pointer per query, each to the 32-bit words
+// of that query's own bitset over the index's rows (bit i % 32 of word i / 32 is set when row i
+// passes), on the device being searched. A null pointer leaves that query unfiltered.
+// The search must still be given a non-nil allowList. Its bitset is then not read, so queries
+// with different filters can share one search call.
+// The filtering rate must be given unless the filter expansion is FilterExpansionPassingTwoHop,
+// and the algo must be SearchAlgoMultiCta or SearchAlgoAuto, which then selects it.
+// The address is stored as given and used by every search with these params. SearchParams does
+// not own the array or the bitsets: they must stay valid until the search's work on the stream
+// has finished (see Resource.Sync).
+func (p *SearchParams) SetQueryBitsets(query_bitsets uintptr) (*SearchParams, error) {
+	p.params.query_bitsets = C.uintptr_t(query_bitsets)
 	return p, nil
 }
 

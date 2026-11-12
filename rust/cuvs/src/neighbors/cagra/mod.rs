@@ -136,6 +136,43 @@ impl From<ffi::cuvsCagraHashMode> for HashMode {
     }
 }
 
+/// How a filtered [`SearchAlgo::MultiCta`] search walks the graph.
+///
+/// With [`FilterExpansion::PassingTwoHop`], [`SearchAlgo::Auto`] selects
+/// [`SearchAlgo::MultiCta`]. Other search algorithms ignore it.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FilterExpansion {
+    /// Score all -- every neighbor of an expanded node is scored and may be
+    /// expanded in turn, whether or not it passes the filter; rejected nodes
+    /// are dropped from the results. This is the default.
+    ScoreAll,
+    /// Passing two-hop -- only nodes that pass the filter are scored, kept and
+    /// expanded. A rejected neighbor is not scored: its own neighbors are
+    /// examined instead. The search starts from random nodes that pass the
+    /// filter (`num_random_samplings` of them per start slot, the nearest
+    /// kept). Best for filters that reject most of the index.
+    PassingTwoHop,
+}
+
+impl From<FilterExpansion> for ffi::cuvsCagraFilterExpansion {
+    fn from(v: FilterExpansion) -> Self {
+        match v {
+            FilterExpansion::ScoreAll => Self::CUVS_CAGRA_FILTER_SCORE_ALL,
+            FilterExpansion::PassingTwoHop => Self::CUVS_CAGRA_FILTER_PASSING_TWO_HOP,
+        }
+    }
+}
+
+impl From<ffi::cuvsCagraFilterExpansion> for FilterExpansion {
+    fn from(v: ffi::cuvsCagraFilterExpansion) -> Self {
+        match v {
+            ffi::cuvsCagraFilterExpansion::CUVS_CAGRA_FILTER_SCORE_ALL => Self::ScoreAll,
+            ffi::cuvsCagraFilterExpansion::CUVS_CAGRA_FILTER_PASSING_TWO_HOP => Self::PassingTwoHop,
+        }
+    }
+}
+
 /// Error type for CAGRA operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

@@ -692,6 +692,73 @@ public class CagraBuildAndSearchIT extends CuVSTestCase {
   }
 
   /**
+   * A test that checks pre-filtering with the PASSING_TWO_HOP filter expansion, where a MULTI_CTA
+   * search walks the graph only through the rows that pass the prefilter.
+   */
+  @Test
+  public void testPrefilteringWithPassingTwoHop() throws Throwable {
+    int numRows = 2000;
+    int dimensions = 10;
+    int topK = 10;
+
+    float[][] dataset = generateData(random, numRows, dimensions);
+    float[][] queries = generateData(random, 8, dimensions);
+
+    // Apply prefilter: only allow one row in four
+    BitSet prefilter = new BitSet(numRows);
+    for (int i = 0; i < numRows; i += 4) {
+      prefilter.set(i);
+    }
+
+    CagraIndexParams indexParams =
+        new CagraIndexParams.Builder()
+            .withCagraGraphBuildAlgo(CagraGraphBuildAlgo.NN_DESCENT)
+            .withGraphDegree(32)
+            .withIntermediateGraphDegree(64)
+            .withMetric(CuvsDistanceType.L2Expanded)
+            .build();
+
+    try (CuVSResources resources = CheckedCuVSResources.create();
+        CagraIndex index =
+            CagraIndex.newBuilder(resources)
+                .fromDataset(dataset)
+                .withIndexParams(indexParams)
+                .build();
+        var hostVectors = CuVSMatrix.ofArray(dataset);
+        var deviceVectors = hostVectors.toDevice(resources);
+        var indexDataset = index.makePaddedDataset(deviceVectors);
+        var queryVectors = CuVSMatrix.ofArray(queries)) {
+
+      index.updateDataset(indexDataset);
+
+      CagraSearchParams searchParams =
+          new CagraSearchParams.Builder()
+              .withAlgo(CagraSearchParams.SearchAlgo.MULTI_CTA)
+              .withFilterExpansion(CagraSearchParams.FilterExpansion.PASSING_TWO_HOP)
+              .build();
+
+      CagraQuery filteredQuery =
+          new CagraQuery.Builder(resources)
+              .withTopK(topK)
+              .withSearchParams(searchParams)
+              .withQueryVectors(queryVectors)
+              .withPrefilter(prefilter, numRows)
+              .build();
+
+      List<Map<Integer, Float>> filteredResults = index.search(filteredQuery).getResults();
+      log.debug("Filtered results: {}", filteredResults);
+
+      assertEquals(queries.length, filteredResults.size());
+      for (Map<Integer, Float> result : filteredResults) {
+        assertFalse("No neighbors returned", result.isEmpty());
+        for (int id : result.keySet()) {
+          assertTrue("Returned a row that the prefilter removes: " + id, prefilter.get(id));
+        }
+      }
+    }
+  }
+
+  /**
    * Regression test for a bug in {@code CagraIndexImpl.search}: the {@code distances} output tensor
    * was described (dtype and buffer size) using the <em>query</em> vectors' data type instead of the
    * float32 type the C API mandates. Float queries masked the bug because their dtype already matches

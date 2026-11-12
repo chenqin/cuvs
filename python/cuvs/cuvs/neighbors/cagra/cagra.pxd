@@ -95,6 +95,10 @@ cdef extern from "cuvs/neighbors/cagra.h" nogil:
         SMALL,
         AUTO_HASH
 
+    ctypedef enum cuvsCagraFilterExpansion:
+        CUVS_CAGRA_FILTER_SCORE_ALL,
+        CUVS_CAGRA_FILTER_PASSING_TWO_HOP
+
     ctypedef struct cuvsCagraSearchParams:
         size_t max_queries
         size_t itopk_size
@@ -112,6 +116,9 @@ cdef extern from "cuvs/neighbors/cagra.h" nogil:
         bool persistent
         float persistent_lifetime
         float persistent_device_usage
+        float filtering_rate
+        cuvsCagraFilterExpansion filter_expansion
+        uintptr_t query_bitsets
 
     ctypedef cuvsCagraSearchParams* cuvsCagraSearchParams_t
 
@@ -225,3 +232,4 @@ cdef class IndexParams:
 
 cdef class SearchParams:
     cdef cuvsCagraSearchParams * params
+    cdef object _query_bitsets_owner

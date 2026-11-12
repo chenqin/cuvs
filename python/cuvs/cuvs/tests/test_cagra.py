@@ -3,6 +3,7 @@
 #
 
 import tempfile
+import weakref
 
 import cupy as cp
 import numpy as np
@@ -12,7 +13,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 
 from cuvs.common import make_device_padded_dataset
-from cuvs.neighbors import cagra, ivf_pq
+from cuvs.neighbors import cagra, filters, ivf_pq
 from cuvs.tests.ann_utils import (
     calc_recall,
     generate_data,
@@ -229,6 +230,145 @@ def test_cagra_build_from_dataset_handle(
 @pytest.mark.parametrize("sparsity", [0.2, 0.5, 0.7, 1.0])
 def test_filtered_cagra(sparsity):
     run_filtered_search_test(cagra, sparsity)
+
+
+def pack_bitset(mask):
+    # Bit `i % 32` of word `i // 32` is set when row `i` passes the filter
+    padded = np.zeros(-(-mask.size // 32) * 32, dtype=bool)
+    padded[: mask.size] = mask
+    return np.packbits(padded, bitorder="little").view(np.uint32)
+
+
+def calc_filtered_recall(dataset, queries, neighbors, masks):
+    # Checks that every returned row passes the mask of its query, and
+    # calculates the recall against a brute-force search of the passing rows
+    n_rows = dataset.shape[0]
+    k = neighbors.shape[1]
+    expected = np.zeros_like(neighbors)
+    for i, mask in enumerate(masks):
+        found = neighbors[i][neighbors[i] < n_rows]
+        assert mask[found].all()
+        passing = np.flatnonzero(mask)
+        distances = ((dataset[passing] - queries[i]) ** 2).sum(axis=1)
+        expected[i] = passing[np.argsort(distances)[:k]]
+    return calc_recall(neighbors, expected)
+
+
+def test_cagra_filter_expansion_two_hop(
+    n_rows=10000, n_cols=10, n_queries=100, k=10, per_cluster=100
+):
+    # Clustered rows and a filter that passes whole clusters
+    n_clusters = n_rows // per_cluster
+    centers = np.random.uniform(-1, 1, (n_clusters, n_cols))
+    dataset = np.repeat(centers, per_cluster, axis=0)
+    dataset += np.random.normal(0, 0.05, dataset.shape)
+    dataset = dataset.astype(np.float32)
+    queries = centers[np.random.randint(n_clusters, size=n_queries)]
+    queries += np.random.normal(0, 0.2, queries.shape)
+    queries = queries.astype(np.float32)
+    mask = (np.arange(n_rows) // per_cluster) % 10 == 3
+
+    index = cagra.build(cagra.IndexParams(), device_ndarray(dataset))
+
+    search_params = cagra.SearchParams(
+        algo="multi_cta", filter_expansion="passing_two_hop"
+    )
+    _, neighbors = cagra.search(
+        search_params,
+        index,
+        device_ndarray(queries),
+        k,
+        filter=filters.from_bitset(device_ndarray(pack_bitset(mask))),
+    )
+
+    recall = calc_filtered_recall(
+        dataset, queries, neighbors.copy_to_host(), [mask] * n_queries
+    )
+    assert recall > 0.9
+
+
+@pytest.mark.parametrize(
+    "filter_expansion, filtering_rate",
+    [("score_all", 0.5), ("passing_two_hop", None)],
+)
+def test_cagra_query_bitsets(
+    filter_expansion,
+    filtering_rate,
+    n_rows=10000,
+    n_cols=10,
+    n_queries=100,
+    k=10,
+):
+    dataset = generate_data((n_rows, n_cols), np.float32)
+    queries = generate_data((n_queries, n_cols), np.float32)
+
+    # Even queries search one random half of the rows, odd queries the other
+    half = np.random.random_sample(n_rows) < 0.5
+    masks = [half, ~half]
+    bitsets = [cp.asarray(pack_bitset(mask)) for mask in masks]
+    query_bitsets = cp.array(
+        [bitsets[i % 2].data.ptr for i in range(n_queries)], dtype=cp.uint64
+    )
+
+    index = cagra.build(cagra.IndexParams(), device_ndarray(dataset))
+
+    search_params = cagra.SearchParams(
+        algo="multi_cta",
+        filtering_rate=filtering_rate,
+        filter_expansion=filter_expansion,
+        query_bitsets=query_bitsets,
+    )
+    # The bitset of the filter itself is not read
+    _, neighbors = cagra.search(
+        search_params,
+        index,
+        device_ndarray(queries),
+        k,
+        filter=filters.from_bitset(bitsets[0]),
+    )
+
+    recall = calc_filtered_recall(
+        dataset,
+        queries,
+        neighbors.copy_to_host(),
+        [masks[i % 2] for i in range(n_queries)],
+    )
+    assert recall > 0.9
+
+
+def test_cagra_filter_search_params():
+    search_params = cagra.SearchParams()
+    assert search_params.filtering_rate == 0
+    assert search_params.filter_expansion == "score_all"
+    assert search_params.query_bitsets == 0
+
+    query_bitsets = cp.zeros(4, dtype=cp.uint64)
+    search_params = cagra.SearchParams(
+        filtering_rate=0.9,
+        filter_expansion="passing_two_hop",
+        query_bitsets=query_bitsets,
+    )
+    assert np.isclose(search_params.filtering_rate, 0.9)
+    assert search_params.filter_expansion == "passing_two_hop"
+    assert search_params.query_bitsets == query_bitsets.data.ptr
+
+    # The parameters keep the pointer array alive
+    query_bitsets_ref = weakref.ref(query_bitsets)
+    del query_bitsets
+    assert query_bitsets_ref() is not None
+
+    # A device address is taken as it is
+    search_params = cagra.SearchParams(query_bitsets=0x1000)
+    assert search_params.query_bitsets == 0x1000
+
+    with pytest.raises(ValueError):
+        cagra.SearchParams(filter_expansion="unknown")
+    with pytest.raises(TypeError):
+        cagra.SearchParams(query_bitsets=cp.zeros(4, dtype=cp.uint32))
+    with pytest.raises(ValueError):
+        cagra.SearchParams(query_bitsets=cp.zeros((2, 2), dtype=cp.uint64))
+    with pytest.raises(TypeError):
+        cagra.SearchParams(query_bitsets=np.zeros(4, dtype=np.uint64))
 
 
 @pytest.mark.parametrize(
