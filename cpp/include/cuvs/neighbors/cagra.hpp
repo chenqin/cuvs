@@ -74,7 +74,7 @@ enum class filter_expansion_mode {
    * distance computations on nodes it then drops, and is most effective when the rows a filter
    * passes are near each other. With too few passing rows for any to lie within two hops of one
    * another (under roughly one row in the square of the graph degree), the walk cannot leave its
-   * start nodes; scan the passing rows instead.
+   * start nodes; scan the passing rows instead. Multi-partition search ignores this mode.
    */
   PASSING_TWO_HOP = 1
 };
@@ -164,8 +164,10 @@ struct search_params : cuvs::neighbors::search_params {
    * per query, each to the 32-bit words of that query's own bitset over the index's rows (bit
    * `i % 32` of word `i / 32` is set when row `i` passes), on the device being searched. The
    * bitset of the filter object is then not read, so queries with different filters can share one
-   * search call. `filtering_rate` must be given unless `filter_expansion` is PASSING_TWO_HOP,
-   * which does not use it. The array and the bitsets must stay valid until the search's work on
+   * search call. A null pointer leaves that query unfiltered. `filtering_rate` must be given
+   * unless `filter_expansion` is PASSING_TWO_HOP, which does not use it. The search fails if the
+   * algorithm is not MULTI_CTA (set `algo`: AUTO may choose another), and multi-partition search
+   * does not take it. The array and the bitsets must stay valid until the search's work on
    * the stream has finished.
    */
   const uint32_t* const* query_bitsets = nullptr;

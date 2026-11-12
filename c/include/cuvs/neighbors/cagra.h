@@ -555,8 +555,8 @@ struct cuvsCagraSearchParams {
    * per query, each to the 32-bit words of that query's own bitset over the index's rows (bit
    * `i % 32` of word `i / 32` is set when row `i` passes), on the device being searched. The
    * filter's own bitset is then not read, so queries with different filters can share one
-   * search call. `filtering_rate` must be given unless `filter_expansion` is
-   * CUVS_CAGRA_FILTER_PASSING_TWO_HOP. The array and the bitsets must stay valid until the
+   * search call. A null pointer leaves that query unfiltered. `filtering_rate` must be given
+   * unless `filter_expansion` is CUVS_CAGRA_FILTER_PASSING_TWO_HOP. `algo` must be MULTI_CTA. The array and the bitsets must stay valid until the
    * search's work on the stream has finished.
    */
   uintptr_t query_bitsets;

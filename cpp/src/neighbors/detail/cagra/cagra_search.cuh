@@ -89,6 +89,10 @@ void search_main_core(
       res, params, dataset_desc, query_logical_dim, graph.extent(0), graph.extent(1), topk);
 
   plan->check(topk);
+  // Only the MULTI_CTA kernel reads one bitset per query; any other would filter every query by
+  // the filter object's own bitset.
+  RAFT_EXPECTS(params.query_bitsets == nullptr || plan->algo == search_algo::MULTI_CTA,
+               "search_params::query_bitsets needs the MULTI_CTA algorithm (set search_params::algo)");
 
   RAFT_LOG_DEBUG("Cagra search");
   const uint32_t max_queries = plan->max_queries;
@@ -367,6 +371,13 @@ void search_multi_partition(
 {
   static_assert(std::is_same_v<IdxT, uint32_t>, "Only uint32_t graph index type is supported");
   static_assert(std::is_same_v<DistanceT, float>, "Only float distances are supported");
+
+  // Partitions are filtered by their own bitsets with the SCORE_ALL walk: the two-hop walk and
+  // per-query bitsets are single-index features. Leaving PASSING_TWO_HOP set would only drop the
+  // candidate-list lengthening that SCORE_ALL needs.
+  RAFT_EXPECTS(params.query_bitsets == nullptr,
+               "search_params::query_bitsets is not supported by multi-partition search");
+  params.filter_expansion = filter_expansion_mode::SCORE_ALL;
 
   // The index type in this signature pins the dataset view to the default, so every partition is
   // statically known to hold a padded (non-compressed) device dataset.
