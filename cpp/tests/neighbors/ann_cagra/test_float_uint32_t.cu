@@ -141,7 +141,11 @@ namespace {
 // Runs a filtered multi-partition MULTI_CTA search where every partition keeps only ~4% of its rows
 // (still more than k each) and reports the number of queries that returned fewer than k neighbors
 // and the recall against an exact search over the kept rows.
-void search_with_selective_filter(float filtering_rate, int& short_queries, double& recall)
+void search_with_selective_filter(
+  float filtering_rate,
+  int& short_queries,
+  double& recall,
+  cagra::filter_expansion_mode filter_expansion = cagra::filter_expansion_mode::SCORE_ALL)
 {
   raft::resources handle;
   auto stream = raft::resource::get_cuda_stream(handle);
@@ -202,9 +206,10 @@ void search_with_selective_filter(float filtering_rate, int& short_queries, doub
   // A small itopk_size, as used for small k, on the MULTI_CTA algorithm that AUTO picks for a
   // handful of queries over a handful of partitions.
   cagra::search_params search_params;
-  search_params.algo           = search_algo::MULTI_CTA;
-  search_params.itopk_size     = k;
-  search_params.filtering_rate = filtering_rate;
+  search_params.algo             = search_algo::MULTI_CTA;
+  search_params.itopk_size       = k;
+  search_params.filtering_rate   = filtering_rate;
+  search_params.filter_expansion = filter_expansion;
 
   cagra::search(
     handle,
@@ -281,6 +286,32 @@ TEST(AnnCagraMultiPartition, SelectiveFilterReturnsKNeighbors)
   search_with_selective_filter(-1.0f, short_queries, recall);
   EXPECT_EQ(short_queries, 0) << "queries returning fewer than k neighbors";
   EXPECT_GE(recall, 0.95);
+}
+
+// Multi-partition search filters each partition by its own bitset and walks as SCORE_ALL whatever
+// filter_expansion asks for. Were PASSING_TWO_HOP to reach the search plan, the candidate list
+// would not be lengthened by the filtering rate, and this filter would leave queries short of
+// neighbors.
+TEST(AnnCagraMultiPartition, PassingTwoHopWalksAsScoreAll)
+{
+  int short_queries = 0;
+  double recall     = 0;
+  search_with_selective_filter(
+    -1.0f, short_queries, recall, cagra::filter_expansion_mode::PASSING_TWO_HOP);
+  EXPECT_EQ(short_queries, 0) << "queries returning fewer than k neighbors";
+  EXPECT_GE(recall, 0.95);
+}
+
+// One bitset per query belongs to single-index search: a partition is filtered by its own
+// bitset. The pointer array is not read, the search is refused before that.
+TEST(AnnCagraMultiPartition, QueryBitsetsRejected)
+{
+  const uint32_t* const query_bitsets[] = {nullptr};
+  cagra::search_params search_params;
+  search_params.query_bitsets = query_bitsets;
+  expect_multi_partition_search_throws({{cuvs::distance::DistanceType::L2Expanded, 16},
+                                        {cuvs::distance::DistanceType::L2Expanded, 16}},
+                                       search_params);
 }
 
 // The shared plan descriptor and the cross-partition select_k direction are derived from

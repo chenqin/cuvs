@@ -89,10 +89,6 @@ void search_main_core(
       res, params, dataset_desc, query_logical_dim, graph.extent(0), graph.extent(1), topk);
 
   plan->check(topk);
-  // Only the MULTI_CTA kernel reads one bitset per query; any other would filter every query by
-  // the filter object's own bitset.
-  RAFT_EXPECTS(params.query_bitsets == nullptr || plan->algo == search_algo::MULTI_CTA,
-               "search_params::query_bitsets needs the MULTI_CTA algorithm (set search_params::algo)");
 
   RAFT_LOG_DEBUG("Cagra search");
   const uint32_t max_queries = plan->max_queries;

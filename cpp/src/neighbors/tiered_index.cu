@@ -221,6 +221,9 @@ void search(raft::resources const& res,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances,
             const cuvs::neighbors::filtering::base_filter& sample_filter)
 {
+  // The brute-force tier would still filter every query by the filter object's own bitset.
+  RAFT_EXPECTS(search_params.query_bitsets == nullptr,
+               "search_params::query_bitsets is not supported by tiered_index::search");
   std::shared_lock<std::shared_mutex> lock(index.ann_mutex);
   index.state->search(
     res, search_params, cagra::search, queries, neighbors, distances, sample_filter);
@@ -234,6 +237,9 @@ void search(raft::resources const& res,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances,
             const cuvs::neighbors::filtering::base_filter& sample_filter)
 {
+  // The brute-force tier would still filter every query by the filter object's own bitset.
+  RAFT_EXPECTS(search_params.query_bitsets == nullptr,
+               "search_params::query_bitsets is not supported by tiered_index::search");
   std::shared_lock<std::shared_mutex> lock(index.ann_mutex);
   if (!index.state->ann_index) {
     index.state->search(

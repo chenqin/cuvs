@@ -65,8 +65,9 @@ enum class filter_expansion_mode {
   SCORE_ALL = 0,
   /**
    * Only nodes that pass the filter are scored, kept and expanded. A rejected neighbor is not
-   * scored: its own neighbors are examined instead, so a node's children are the passing nodes
-   * within two hops. The search starts from random nodes that pass the filter
+   * scored: its own neighbors are examined instead, so a node's children are its passing
+   * neighbors and the passing neighbors of its rejected neighbors, up to about the graph degree
+   * of them per expansion. The search starts from random nodes that pass the filter
    * (`num_random_samplings` of them per start slot, the nearest kept), and the candidate list is
    * not lengthened by the filtering rate, which is not needed and not computed.
    *
@@ -156,7 +157,10 @@ struct search_params : cuvs::neighbors::search_params {
    */
   float filtering_rate = -1.0;
 
-  /** How a filtered MULTI_CTA search walks the graph. Other algorithms ignore it. */
+  /**
+   * How a filtered MULTI_CTA search walks the graph. PASSING_TWO_HOP selects MULTI_CTA when `algo`
+   * is AUTO; the other algorithms ignore it, with a warning.
+   */
   filter_expansion_mode filter_expansion = filter_expansion_mode::SCORE_ALL;
 
   /**
@@ -164,11 +168,12 @@ struct search_params : cuvs::neighbors::search_params {
    * per query, each to the 32-bit words of that query's own bitset over the index's rows (bit
    * `i % 32` of word `i / 32` is set when row `i` passes), on the device being searched. The
    * bitset of the filter object is then not read, so queries with different filters can share one
-   * search call. A null pointer leaves that query unfiltered. `filtering_rate` must be given
-   * unless `filter_expansion` is PASSING_TWO_HOP, which does not use it. The search fails if the
-   * algorithm is not MULTI_CTA (set `algo`: AUTO may choose another), and multi-partition search
-   * does not take it. The array and the bitsets must stay valid until the search's work on
-   * the stream has finished.
+   * search call. A null pointer leaves that query unfiltered. The array must hold a pointer for
+   * every query of the call. `filtering_rate` must be given unless `filter_expansion` is
+   * PASSING_TWO_HOP, which does not use it. It selects MULTI_CTA when `algo` is AUTO, and the
+   * search fails with any other algorithm. Multi-partition search, tiered-index search and
+   * dynamic batching do not take it. The array and the bitsets must stay valid until the search's
+   * work on the stream has finished.
    */
   const uint32_t* const* query_bitsets = nullptr;
 

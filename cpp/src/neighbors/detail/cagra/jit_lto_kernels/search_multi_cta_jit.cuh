@@ -57,12 +57,13 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
   constexpr IndexT invalid_index = ~static_cast<IndexT>(0);
   constexpr uint32_t kRounds     = 8;  // rounds of kWide tries a draw
   constexpr uint32_t kWide       = 4;  // words (or nodes) read together in a round
+  // Added to the random state for every try of a draw (2^64 divided by the golden ratio).
+  constexpr uint64_t kTryIncrement = 0x9E3779B97F4A7C15ull;
 
   const uint32_t team_size_bits = smem_desc->team_size_bitshift_from_smem();
   const auto args_load          = smem_desc->args.load();
   const auto max_i = raft::round_up_safe<uint32_t>(num_pickup, device::warp_size >> team_size_bits);
-  const uint32_t num_words =
-    static_cast<uint32_t>((static_cast<uint64_t>(node_limit) + 31) / 32);
+  const uint32_t num_words = static_cast<uint32_t>((static_cast<uint64_t>(node_limit) + 31) / 32);
 
   for (uint32_t i = threadIdx.x >> team_size_bits; i < max_i; i += (blockDim.x >> team_size_bits)) {
     const bool valid_i = (i < num_pickup);
@@ -79,8 +80,10 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
           uint64_t r[kWide];
           for (uint32_t u = 0; u < kWide; u++) {
             r[u] = cuvs::neighbors::detail::device::xorshift64(
-              (gid + 0x9E3779B97F4A7C15ull * (round * kWide + u + 1)) ^ rand_xor_mask);
+              (gid + kTryIncrement * (round * kWide + u + 1)) ^ rand_xor_mask);
           }
+          // The low bits of a random number choose the bit within a word; the word (or the
+          // node) is chosen by the bits above them.
           if (filter_words != nullptr) {
             std::uint32_t word[kWide];
             for (uint32_t u = 0; u < kWide; u++) {
@@ -188,11 +191,15 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
 
   // Second hop: the neighbors of each bridge, until the buffer is full. A thread reads a few
   // graph entries, then their filter words, before it uses any of them, so the loads overlap;
-  // a warp's threads read one bridge's row together. At most 256 entries are examined between
-  // two looks at the buffer, which bounds what one round adds to the visited hash.
-  const uint32_t num_slots = knn_k * knn_k;
-  const uint32_t unroll    = blockDim.x >= 256 ? 1u : (256u / blockDim.x);
-  constexpr uint32_t kMaxUnroll = 4;
+  // a warp's threads read one bridge's row together. Between two looks at the buffer a round
+  // examines kSlotsPerRound entries, or one entry a thread in a larger block. The visited hash
+  // is sized for a round of kSlotsPerRound (see search_plan.cuh); a child it has no room for is
+  // dropped.
+  constexpr uint32_t kSlotsPerRound = 256;
+  constexpr uint32_t kMaxUnroll     = 4;
+  const uint32_t num_slots          = knn_k * knn_k;
+  const uint32_t per_thread         = kSlotsPerRound / blockDim.x;
+  const uint32_t unroll = per_thread < 1 ? 1u : (per_thread > kMaxUnroll ? kMaxUnroll : per_thread);
   for (uint32_t s0 = threadIdx.x; s0 < num_slots; s0 += blockDim.x * unroll) {
     if (result_position[0] <= min_result_position) { break; }
     IndexT child[kMaxUnroll];
@@ -223,9 +230,9 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
   const auto team_size_bits = smem_desc->team_size_bitshift_from_smem();
   const int first =
     result_position[0] < min_result_position ? min_result_position : result_position[0];
-  const auto max_i = raft::round_up_safe<uint32_t>(
-    static_cast<uint32_t>(max_result_position - min_result_position),
-    device::warp_size >> team_size_bits);
+  const auto max_i =
+    raft::round_up_safe<uint32_t>(static_cast<uint32_t>(max_result_position - min_result_position),
+                                  device::warp_size >> team_size_bits);
   const auto args      = smem_desc->args.load();
   const bool lead_lane = (threadIdx.x & ((1u << team_size_bits) - 1u)) == 0;
 
@@ -310,15 +317,18 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
   // Generalized row index: single-partition launches gridDim.z == 1 so row == query_id.
   const auto row = partition_id * num_queries + query_id;
 
-  // The filter. When the host says it is a bitset whose words can be read as they are (see
-  // cagra_sample_filter_flags), a test is one load of a word; any other filter goes through the
+  // The filter. When the host says it is a bitset whose words can be read as they are (see the
+  // kCagraFilter* flags), a test is one load of a word; any other filter goes through the
   // linked sample_filter. With one bitset per query, a query whose pointer is null is unfiltered.
-  const bool passing_two_hop     = (filter_payload.flags & kCagraFilterPassingTwoHop) != 0;
-  const bool has_query_bitsets   = (filter_payload.flags & kCagraFilterQueryBitsets) != 0;
+  // Seed nodes given by the caller are not filtered, so a search that has them keeps the
+  // SCORE_ALL walk and its filtering of the list.
+  const bool passing_two_hop =
+    (filter_payload.flags & kCagraFilterPassingTwoHop) != 0 && seed_ptr == nullptr;
+  const bool has_query_bitsets      = (filter_payload.flags & kCagraFilterQueryBitsets) != 0;
   const std::uint32_t* filter_words = nullptr;
   if (has_query_bitsets) {
-    filter_words = static_cast<const std::uint32_t* const*>(filter_payload.filter_data)
-      [query_id + query_id_offset];
+    filter_words = static_cast<const std::uint32_t* const*>(
+      filter_payload.filter_data)[query_id + query_id_offset];
   } else if (filter_payload.flags & kCagraFilterBitsetWords) {
     filter_words = static_cast<const BitsetT*>(filter_payload.filter_data)->bitset_ptr;
   }
@@ -399,7 +409,7 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
   uint32_t block_id                   = cta_id + (num_cta_per_query * row);
   uint32_t num_blocks                 = num_cta_per_query * num_queries * gridDim.z;
 
-  if (passing_two_hop && local_seed_ptr == nullptr) {
+  if (passing_two_hop) {
     compute_distance_to_random_passing_nodes_jit<IndexT, DistanceT, DataT>(
       result_indices_buffer,
       result_distances_buffer,

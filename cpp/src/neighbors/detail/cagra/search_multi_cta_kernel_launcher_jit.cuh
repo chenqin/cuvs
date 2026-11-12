@@ -31,8 +31,9 @@
 namespace cuvs::neighbors::cagra::detail::multi_cta_search {
 
 // What the MULTI_CTA kernel may do with a filter beyond calling the linked sample_filter (see
-// cagra_sample_filter_flags): read a bitset's words itself, take one bitset per query, and walk
-// through passing nodes only.
+// the kCagraFilter* flags): read a bitset's words itself, take one bitset per query, and walk
+// through passing nodes only. With the default parameters no flag is set, and the kernel calls
+// the linked sample_filter as every other kernel does.
 template <typename SourceIndexT, typename SampleFilterT>
 void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
                                 const SampleFilterT& sample_filter,
@@ -42,7 +43,8 @@ void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
                   sample_filter.filter;
                   sample_filter.offset;
                 }) {
-    using inner_t = std::decay_t<decltype(sample_filter.filter)>;
+    using inner_t      = std::decay_t<decltype(sample_filter.filter)>;
+    const bool two_hop = ps.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP;
     if constexpr (is_bitset_filter<inner_t>::value) {
       const auto view = sample_filter.filter.view();
       // bitset_view::test() is `(word[i / 32] >> (i % 32)) & 1` for 32-bit words that were not
@@ -53,16 +55,16 @@ void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
         RAFT_EXPECTS(plain_words, "query_bitsets needs a bitset_filter of 32-bit words");
         payload.filter_data = const_cast<void*>(static_cast<const void*>(ps.query_bitsets));
         payload.flags |= kCagraFilterQueryBitsets;
-      } else if (plain_words && payload.filter_data != nullptr && view.data() != nullptr) {
+      } else if (two_hop && plain_words && payload.filter_data != nullptr &&
+                 view.data() != nullptr) {
         payload.flags |= kCagraFilterBitsetWords;
       }
     } else {
       RAFT_EXPECTS(ps.query_bitsets == nullptr, "query_bitsets needs a bitset_filter");
     }
-    if (ps.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP &&
-        payload.filter_data != nullptr) {
-      payload.flags |= kCagraFilterPassingTwoHop;
-    }
+    // The plan sizes the candidate list and the shared memory by the same parameter, so the
+    // kernel must walk as it says whatever the filter keeps in its payload.
+    if (two_hop) { payload.flags |= kCagraFilterPassingTwoHop; }
   } else {
     RAFT_EXPECTS(ps.query_bitsets == nullptr, "query_bitsets needs a bitset_filter");
   }

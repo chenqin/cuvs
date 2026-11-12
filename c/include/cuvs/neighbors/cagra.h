@@ -541,13 +541,17 @@ struct cuvsCagraSearchParams {
   float persistent_device_usage;
 
   /**
-   * Fraction of the index's rows the filter removes, greater than 0 and less than 1. 0 (the
-   * default): computed from the filter by each search that needs it, which reads the whole
-   * bitset and waits for the result.
+   * Fraction of the index's rows the filter removes, greater than 0 and less than 1. When it is
+   * 0, as it is by default, each search that needs the rate computes it from the filter, which
+   * reads the whole bitset and waits for the result.
    */
   float filtering_rate;
 
-  /** How a filtered MULTI_CTA search walks the graph. Other algorithms ignore it. */
+  /**
+   * How a filtered MULTI_CTA search walks the graph. CUVS_CAGRA_FILTER_PASSING_TWO_HOP selects
+   * MULTI_CTA when `algo` is AUTO; the other algorithms and cuvsCagraSearchMultiPartition ignore
+   * it.
+   */
   enum cuvsCagraFilterExpansion filter_expansion;
 
   /**
@@ -555,8 +559,10 @@ struct cuvsCagraSearchParams {
    * per query, each to the 32-bit words of that query's own bitset over the index's rows (bit
    * `i % 32` of word `i / 32` is set when row `i` passes), on the device being searched. The
    * filter's own bitset is then not read, so queries with different filters can share one
-   * search call. A null pointer leaves that query unfiltered. `filtering_rate` must be given
-   * unless `filter_expansion` is CUVS_CAGRA_FILTER_PASSING_TWO_HOP. `algo` must be MULTI_CTA. The array and the bitsets must stay valid until the
+   * search call. A null pointer leaves that query unfiltered. The array must hold a pointer for
+   * every query of the call. `filtering_rate` must be given unless `filter_expansion` is
+   * CUVS_CAGRA_FILTER_PASSING_TWO_HOP. `algo` must be MULTI_CTA or AUTO. Multi-partition and
+   * tiered-index search do not take it. The array and the bitsets must stay valid until the
    * search's work on the stream has finished.
    */
   uintptr_t query_bitsets;

@@ -277,9 +277,10 @@ struct search_plan_impl : public search_plan_impl_base {
       // table that each CTA has in the shared memory. This hash table is not
       // shared among CTAs. This hash table is reset and restored in each iteration.
       //
-      // A PASSING_TWO_HOP expansion also registers the second-hop nodes that pass: at most 256
-      // graph entries are examined between two looks at the child buffer, of which a share
-      // passes while the buffer is not yet full.
+      // A PASSING_TWO_HOP expansion also registers the second-hop nodes that pass. The kernel
+      // examines 256 graph entries between two looks at the child buffer (one entry a thread in
+      // a larger block), of which a share passes while the buffer is not yet full. A child the
+      // table has no room for is dropped, not duplicated.
       const uint32_t max_visited_nodes =
         mc_itopk_size + (graph_degree * 2) +
         (filter_expansion == filter_expansion_mode::PASSING_TWO_HOP ? 128 : 0);
@@ -425,6 +426,15 @@ struct search_plan_impl : public search_plan_impl_base {
         thread_block_size != 256 && thread_block_size != 512 && thread_block_size != 1024) {
       error_message += "`thread_block_size` must be 0, 64, 128, 256 or 512. " +
                        std::to_string(thread_block_size) + " has been given.";
+    }
+    if (filter_expansion != filter_expansion_mode::SCORE_ALL &&
+        filter_expansion != filter_expansion_mode::PASSING_TWO_HOP) {
+      error_message += "An invalid filter expansion mode has been given: " +
+                       std::to_string(static_cast<int>(filter_expansion)) + "";
+    }
+    if (query_bitsets != nullptr && algo != search_algo::MULTI_CTA) {
+      // Any other kernel would filter every query by the filter object's own bitset.
+      error_message += "`query_bitsets` needs the MULTI_CTA search algorithm (set `algo`)";
     }
     if (hashmap_min_bitlen > 20) {
       error_message += "`hashmap_min_bitlen` must be equal to or smaller than 20. " +

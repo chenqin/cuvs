@@ -444,6 +444,25 @@ inline float bitset_filtering_rate(
   return std::min(std::max(rate, 0.0f), 0.999f);
 }
 
+/**
+ * PASSING_TWO_HOP and query_bitsets belong to the MULTI_CTA algorithm. As `persistent` does for
+ * SINGLE_CTA, they choose the algorithm of a filtered search when it is left to AUTO, and a walk
+ * that the chosen algorithm will not do is reported.
+ */
+inline void resolve_filtered_search_algo(search_params& params)
+{
+  const bool two_hop = params.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP;
+  if (!two_hop && params.query_bitsets == nullptr) { return; }
+  if (params.algo == search_algo::AUTO && !params.persistent) {
+    params.algo = search_algo::MULTI_CTA;
+  } else if (two_hop && params.algo != search_algo::MULTI_CTA) {
+    RAFT_LOG_WARN(
+      "CAGRA filter_expansion PASSING_TWO_HOP is only supported with MULTI_CTA search (algo=%d); "
+      "filter_expansion will have no effect",
+      static_cast<int>(params.algo));
+  }
+}
+
 template <typename T,
           typename IdxT,
           cuvs::neighbors::ann_dataset_view DatasetViewT,
@@ -461,7 +480,9 @@ void search(raft::resources const& res,
     auto& sample_filter       = dynamic_cast<const none_filter_type&>(sample_filter_ref);
     search_params params_copy = params;
     if (params.filtering_rate < 0.0) { params_copy.filtering_rate = 0.0; }
-    auto sample_filter_copy = sample_filter;
+    // Without a filter there is nothing to walk around.
+    params_copy.filter_expansion = filter_expansion_mode::SCORE_ALL;
+    auto sample_filter_copy      = sample_filter;
     return search_with_filtering<T, IdxT, none_filter_type, OutputIdxT, DatasetViewT>(
       res, params_copy, idx, queries, neighbors, distances, sample_filter_copy);
   } catch (const std::bad_cast&) {
@@ -472,6 +493,7 @@ void search(raft::resources const& res,
       dynamic_cast<const cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>&>(
         sample_filter_ref);
     search_params params_copy = params;
+    resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0) {
       if (params.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
         // The rate only lengthens the SCORE_ALL candidate list: do not count the bitset for it.
@@ -493,6 +515,7 @@ void search(raft::resources const& res,
     auto& sample_filter =
       dynamic_cast<const cuvs::neighbors::filtering::bloom_filter&>(sample_filter_ref);
     search_params params_copy = params;
+    resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0f) {
       auto const* bloom_filter_obj =
         static_cast<const cuvs::core::bloom_filter*>(sample_filter.filter_data);
@@ -516,6 +539,7 @@ void search(raft::resources const& res,
                  "Roaring filter dataset_rows must equal the number of rows in the index.");
 
     search_params params_copy = params;
+    resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0f) {
       params_copy.filtering_rate = sample_filter.filtering_rate();
     }
@@ -529,6 +553,7 @@ void search(raft::resources const& res,
     auto& sample_filter =
       dynamic_cast<const cuvs::neighbors::filtering::udf_filter&>(sample_filter_ref);
     search_params params_copy = params;
+    resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0) {
       const float min_filtering_rate = 0.0f;
       const float max_filtering_rate = 0.999f;

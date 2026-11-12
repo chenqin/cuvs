@@ -1002,6 +1002,132 @@ TEST(CagraC, BuildSearchFiltered)
   cuvsResourcesDestroy(res);
 }
 
+// The filter parameters of cuvsCagraSearchParams: a given filtering rate, the walk through passing
+// rows only, and one bitset per query.
+TEST(CagraC, BuildSearchFilterExpansion)
+{
+  cuvsResources_t res;
+  cuvsResourcesCreate(&res);
+  cudaStream_t stream;
+  cuvsStreamGet(res, &stream);
+
+  constexpr int n_rows = 4, dim = 2, n_queries = 4, k = 1;
+
+  // create dataset DLTensor
+  DLManagedTensor dataset_tensor;
+  dataset_tensor.dl_tensor.data               = dataset;
+  dataset_tensor.dl_tensor.device.device_type = kDLCPU;
+  dataset_tensor.dl_tensor.ndim               = 2;
+  dataset_tensor.dl_tensor.dtype.code         = kDLFloat;
+  dataset_tensor.dl_tensor.dtype.bits         = 32;
+  dataset_tensor.dl_tensor.dtype.lanes        = 1;
+  int64_t dataset_shape[2]                    = {n_rows, dim};
+  dataset_tensor.dl_tensor.shape              = dataset_shape;
+  dataset_tensor.dl_tensor.strides            = nullptr;
+
+  // build index
+  cuvsCagraIndex_t index;
+  cuvsCagraIndexCreate(&index);
+  cuvsCagraIndexParams_t build_params;
+  cuvsCagraIndexParamsCreate(&build_params);
+  set_small_dataset_build_params(build_params);
+  cuvsDataset_t dataset_view;
+  ASSERT_EQ(cuvsDatasetMakeStandardView(res, &dataset_tensor, &dataset_view), CUVS_SUCCESS);
+  ASSERT_EQ(cuvsCagraBuild(res, build_params, dataset_view, index), CUVS_SUCCESS);
+
+  // Host build yields a host index. Attach a device padded dataset to make it searchable.
+  cuvsDataset_t padded_dataset_owner;
+  ASSERT_EQ(cuvsDatasetMakePadded(
+              res, &dataset_tensor, CUVS_DATASET_MEM_TYPE_DEVICE, &padded_dataset_owner),
+            CUVS_SUCCESS);
+  ASSERT_EQ(cuvsCagraUpdateDataset(res, padded_dataset_owner, index), CUVS_SUCCESS);
+
+  rmm::device_uvector<float> queries_d(n_queries * dim, stream);
+  raft::copy(queries_d.data(), (float*)queries, n_queries * dim, stream);
+  rmm::device_uvector<uint32_t> neighbors_d(n_queries * k, stream);
+  rmm::device_uvector<float> distances_d(n_queries * k, stream);
+  auto queries_tensor   = make_device_matrix_tensor(queries_d.data(), n_queries, dim);
+  auto neighbors_tensor = make_device_matrix_tensor(neighbors_d.data(), n_queries, k);
+  auto distances_tensor = make_device_matrix_tensor(distances_d.data(), n_queries, k);
+
+  // `filter` keeps rows 0 and 3; `other_filter` keeps rows 1 and 2.
+  uint32_t other_filter[1] = {0b0110};
+  rmm::device_uvector<uint32_t> filter_d(1, stream);
+  rmm::device_uvector<uint32_t> other_filter_d(1, stream);
+  raft::copy(filter_d.data(), filter, 1, stream);
+  raft::copy(other_filter_d.data(), other_filter, 1, stream);
+  auto filter_tensor = make_device_vector_tensor(filter_d.data(), 1);
+  cuvsFilter prefilter{.addr = (uintptr_t)&filter_tensor, .type = BITSET};
+
+  auto search = [&](cuvsCagraSearchParams_t params) {
+    return cuvsCagraSearch(
+      res, params, index, &queries_tensor, &neighbors_tensor, &distances_tensor, prefilter);
+  };
+  auto expect_filtered_results = [&]() {
+    ASSERT_TRUE(cuvs::devArrMatchHost(
+      neighbors_exp_filtered, neighbors_d.data(), 4, cuvs::Compare<uint32_t>()));
+    ASSERT_TRUE(cuvs::devArrMatchHost(
+      distances_exp_filtered, distances_d.data(), 4, cuvs::CompareApprox<float>(0.001f)));
+  };
+
+  cuvsCagraSearchParams_t search_params;
+  cuvsCagraSearchParamsCreate(&search_params);
+  // By default the rate is automatic, the walk is SCORE_ALL and no query has its own bitset.
+  ASSERT_EQ(search_params->filtering_rate, 0.0f);
+  ASSERT_EQ(search_params->filter_expansion, CUVS_CAGRA_FILTER_SCORE_ALL);
+  ASSERT_EQ(search_params->query_bitsets, (uintptr_t)0);
+
+  // Walking through passing rows only finds the same neighbors, and needs no rate.
+  search_params->algo             = MULTI_CTA;
+  search_params->filter_expansion = CUVS_CAGRA_FILTER_PASSING_TWO_HOP;
+  ASSERT_EQ(search(search_params), CUVS_SUCCESS);
+  expect_filtered_results();
+
+  // One bitset per query: queries 0 and 1 keep rows 1 and 2, query 2 keeps rows 0 and 3, and
+  // the null pointer leaves query 3 unfiltered. The bitset of `prefilter` is not read.
+  uintptr_t bitset_pointers[4] = {(uintptr_t)other_filter_d.data(),
+                                  (uintptr_t)other_filter_d.data(),
+                                  (uintptr_t)filter_d.data(),
+                                  (uintptr_t)0};
+  rmm::device_uvector<uintptr_t> bitset_pointers_d(n_queries, stream);
+  raft::copy(bitset_pointers_d.data(), bitset_pointers, n_queries, stream);
+  uint32_t neighbors_exp_per_query[4] = {2, 2, 3, 1};
+  float distances_exp_per_query[4]    = {0.35904629, 0.21700793, 0.04776672, 0.15224178};
+  auto expect_per_query_results       = [&]() {
+    ASSERT_TRUE(cuvs::devArrMatchHost(
+      neighbors_exp_per_query, neighbors_d.data(), 4, cuvs::Compare<uint32_t>()));
+    ASSERT_TRUE(cuvs::devArrMatchHost(
+      distances_exp_per_query, distances_d.data(), 4, cuvs::CompareApprox<float>(0.001f)));
+  };
+  search_params->query_bitsets = (uintptr_t)bitset_pointers_d.data();
+  ASSERT_EQ(search(search_params), CUVS_SUCCESS);
+  expect_per_query_results();
+
+  // The SCORE_ALL walk lengthens its candidate list by the filtering rate, which is not counted
+  // from one bitset per query: the search fails until the rate is given.
+  search_params->filter_expansion = CUVS_CAGRA_FILTER_SCORE_ALL;
+  ASSERT_EQ(search(search_params), CUVS_ERROR);
+  search_params->filtering_rate = 0.5f;
+  ASSERT_EQ(search(search_params), CUVS_SUCCESS);
+  expect_per_query_results();
+
+  // Only MULTI_CTA reads one bitset per query; any other algorithm must fail, not ignore them.
+  search_params->algo = SINGLE_CTA;
+  ASSERT_EQ(search(search_params), CUVS_ERROR);
+
+  // de-allocate index and res
+  free_tensor(queries_tensor);
+  free_tensor(neighbors_tensor);
+  free_tensor(distances_tensor);
+  free_tensor(filter_tensor);
+  cuvsCagraSearchParamsDestroy(search_params);
+  cuvsDatasetDestroy(dataset_view);
+  cuvsDatasetDestroy(padded_dataset_owner);
+  cuvsCagraIndexParamsDestroy(build_params);
+  cuvsCagraIndexDestroy(index);
+  cuvsResourcesDestroy(res);
+}
+
 TEST(CagraC, BuildMergeSearch)
 {
   cuvsResources_t res;
