@@ -82,6 +82,7 @@ let params = SearchParams::builder().itopk_size(128).build()?;
 | Name | Source |
 | --- | --- |
 | `new` | `rust/cuvs/src/neighbors/cagra/params.rs:233` |
+| `set_query_bitsets` | `rust/cuvs/src/neighbors/cagra/params.rs:433` |
 
 ### new
 
@@ -105,10 +106,50 @@ rand_xor_mask: Option<u64>,
 persistent: Option<bool>,
 persistent_lifetime: Option<f32>,
 persistent_device_usage: Option<f32>,
+filtering_rate: Option<f32>,
+filter_expansion: Option<FilterExpansion>,
 ) -> Result<Self, CagraError>
 ```
 
 _Source: `rust/cuvs/src/neighbors/cagra/params.rs:233`_
+
+### set_query_bitsets
+
+```rust
+pub unsafe fn set_query_bitsets(&mut self, bitsets: *const *const u32)
+```
+
+Gives each query of a filtered [`SearchAlgo::MultiCta`] search its own
+bitset.
+
+`bitsets` is the device address of an array with one pointer per query,
+each to the 32-bit words of that query's own bitset over the index's
+rows (bit `i % 32` of word `i / 32` is set when row `i` passes). A null
+pointer in the array leaves that query unfiltered. The search must
+still be given a [`Filter`](super::Filter), as in
+[`Index::search_filtered`](super::Index::search_filtered); its own
+bitset is then not read, so queries with different filters can share
+one search call.
+
+`algo` must be [`SearchAlgo::MultiCta`] or [`SearchAlgo::Auto`], which
+then selects it, and `filtering_rate` must be given unless
+`filter_expansion` is [`FilterExpansion::PassingTwoHop`]; the search
+fails otherwise. A null `bitsets` goes back to filtering every query by
+the filter's own bitset.
+
+#### Safety
+
+The address is stored as given and read by every search run with these
+parameters until it is replaced or reset to null. For each such search,
+the caller must guarantee that:
+- `bitsets` is the address, on the device being searched, of an array
+with one pointer per query;
+- each of those pointers is null or the address, on the same device, of
+the 32-bit words of a bitset that covers every row of the index;
+- the array and the bitsets stay valid until the search's work on the
+stream has finished.
+
+_Source: `rust/cuvs/src/neighbors/cagra/params.rs:433`_
 
 _Source: `rust/cuvs/src/neighbors/cagra/params.rs:225`_
 

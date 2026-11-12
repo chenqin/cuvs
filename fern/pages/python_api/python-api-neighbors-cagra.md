@@ -283,11 +283,14 @@ CAGRA search parameters
 | `persistent` | `bool, default = false` | Whether to use the persistent version of the kernel |
 | `persistent_lifetime` | `float` | Persistent kernel: time in seconds before the kernel stops if no requests are received. |
 | `persistent_device_usage` | `float` | Sets the fraction of maximum grid size used by persistent kernel. |
+| `filtering_rate` | `float, optional` | Fraction of the index's rows the filter removes, greater than 0 and less than 1. When not given, it is computed from the filter by each search that needs it, which reads the whole bitset and waits for the result. |
+| `filter_expansion` | `str, default = "score_all"` | String denoting how a filtered multi_cta search walks the graph. With "passing_two_hop", algo "auto" selects multi_cta. Other algorithms ignore it.<br />Valid values for filter_expansion: ["score_all", "passing_two_hop"], where:<br /><br />- score_all scores every neighbor of an expanded node, and may expand it in turn, whether or not it passes the filter. Rejected nodes are dropped from the results.<br />- passing_two_hop scores, keeps and expands only the nodes that pass the filter. A rejected neighbor is not scored: its own neighbors are examined instead. The search starts from random nodes that pass the filter (num_random_samplings of them per start slot, the nearest kept). This suits filters that reject most of the index, and is most effective when the rows a filter passes are near each other. The walk cannot leave its start nodes when the passing rows are too few for any to lie within two hops of one another (under roughly one row in the square of the graph degree). |
+| `query_bitsets` | `int or CUDA array interface compliant array, optional` | One bitset per query, for a multi_cta search with a bitset filter (see cuvs.neighbors.filters.from_bitset). Either the device address of an array with one pointer per query, or a one-dimensional device array of dtype uint64 that holds those pointers, for example a cupy array. Each pointer is the device address of the uint32 words of that query's own bitset over the index's rows: bit `i % 32` of word `i // 32` is set when row `i` passes. The array and the bitsets are on the device being searched. The bitset of the filter passed to the search is then not read, so queries with different filters can share one search call. A null pointer leaves that query unfiltered. `filtering_rate` must be given unless `filter_expansion` is "passing_two_hop", and `algo` must be "multi_cta" or "auto", which then selects it. Tiered index search does not take it.<br /><br />The pointer array and the bitsets must stay valid until the search has finished: until `search` returns or, when a `resources` object is passed to it, until `resources.sync()` has been called. An array given here is kept alive by this object. The bitsets it points to, and an array given by its address, are not. |
 
 **Constructor**
 
 ```python
-def __init__(self, *, max_queries=0, itopk_size=64, max_iterations=0, algo="auto", team_size=0, search_width=1, min_iterations=0, thread_block_size=0, hashmap_mode="auto", hashmap_min_bitlen=0, hashmap_max_fill_rate=0.5, num_random_samplings=1, rand_xor_mask=0x128394, persistent=False, persistent_lifetime=None, persistent_device_usage=None )
+def __init__(self, *, max_queries=0, itopk_size=64, max_iterations=0, algo="auto", team_size=0, search_width=1, min_iterations=0, thread_block_size=0, hashmap_mode="auto", hashmap_min_bitlen=0, hashmap_max_fill_rate=0.5, num_random_samplings=1, rand_xor_mask=0x128394, persistent=False, persistent_lifetime=None, persistent_device_usage=None, filtering_rate=None, filter_expansion="score_all", query_bitsets=None )
 ```
 
 **Members**
@@ -308,6 +311,9 @@ def __init__(self, *, max_queries=0, itopk_size=64, max_iterations=0, algo="auto
 | `hashmap_max_fill_rate` | property |
 | `num_random_samplings` | property |
 | `rand_xor_mask` | property |
+| `filtering_rate` | property |
+| `filter_expansion` | property |
+| `query_bitsets` | property |
 
 ### get_handle
 
@@ -391,6 +397,24 @@ def num_random_samplings(self)
 
 ```python
 def rand_xor_mask(self)
+```
+
+### filtering_rate
+
+```python
+def filtering_rate(self)
+```
+
+### filter_expansion
+
+```python
+def filter_expansion(self)
+```
+
+### query_bitsets
+
+```python
+def query_bitsets(self)
 ```
 
 ## build

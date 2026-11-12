@@ -22,6 +22,23 @@ AutoSelect
 
 _Source: `go/cagra/index_params.go:18`_
 
+### FilterExpansion Constants
+
+```go
+const (
+// Every neighbor of an expanded node is scored and may be expanded in turn, whether or not it
+// passes the filter; rejected nodes are dropped from the results. This is the default.
+FilterExpansionScoreAll FilterExpansion = iota
+// Only nodes that pass the filter are scored, kept and expanded. A rejected neighbor is not
+// scored: its own neighbors are examined instead. The search starts from random nodes that
+// pass the filter (num_random_samplings of them per start slot, the nearest kept).
+// For filters that reject most of the index.
+FilterExpansionPassingTwoHop
+)
+```
+
+_Source: `go/cagra/search_params.go:37`_
+
 ### HashmapMode Constants
 
 ```go
@@ -80,6 +97,16 @@ type ExtendParams struct {
 Parameters to extend CAGRA Index
 
 _Source: `go/cagra/extend_params.go:11`_
+
+### FilterExpansion
+
+```go
+type FilterExpansion int
+```
+
+How a MULTI_CTA search walks the graph when a filter is given
+
+_Source: `go/cagra/search_params.go:35`_
 
 ### HashmapMode
 
@@ -224,7 +251,7 @@ func CreateSearchParams() (*SearchParams, error)
 
 Creates a new SearchParams
 
-_Source: `go/cagra/search_params.go:35`_
+_Source: `go/cagra/search_params.go:49`_
 
 ### ExtendIndex
 
@@ -420,7 +447,7 @@ func (p *SearchParams) Close() error
 
 Destroys SearchParams
 
-_Source: `go/cagra/search_params.go:157`_
+_Source: `go/cagra/search_params.go:214`_
 
 ### SearchParams.SetAlgo
 
@@ -430,7 +457,30 @@ func (p *SearchParams) SetAlgo(algo SearchAlgo) (*SearchParams, error)
 
 Which search implementation to use.
 
-_Source: `go/cagra/search_params.go:67`_
+_Source: `go/cagra/search_params.go:81`_
+
+### SearchParams.SetFilterExpansion
+
+```go
+func (p *SearchParams) SetFilterExpansion(filter_expansion FilterExpansion) (*SearchParams, error)
+```
+
+How a filtered MULTI_CTA search walks the graph. With FilterExpansionPassingTwoHop,
+SearchAlgoAuto selects MULTI_CTA. Other algorithms ignore it.
+
+_Source: `go/cagra/search_params.go:180`_
+
+### SearchParams.SetFilteringRate
+
+```go
+func (p *SearchParams) SetFilteringRate(filtering_rate float32) (*SearchParams, error)
+```
+
+Fraction of the index's rows the filter removes. More than 0, less than 1.
+When 0 (the default), it is computed from the filter by each search that needs it,
+which reads the whole bitset and waits for the result.
+
+_Source: `go/cagra/search_params.go:173`_
 
 ### SearchParams.SetHashmapMaxFillRate
 
@@ -440,7 +490,7 @@ func (p *SearchParams) SetHashmapMaxFillRate(hashmap_max_fill_rate float32) (*Se
 
 Upper limit of hashmap fill rate. More than 0.1, less than 0.9.
 
-_Source: `go/cagra/search_params.go:139`_
+_Source: `go/cagra/search_params.go:153`_
 
 ### SearchParams.SetHashmapMinBitlen
 
@@ -450,7 +500,7 @@ func (p *SearchParams) SetHashmapMinBitlen(hashmap_min_bitlen uintptr) (*SearchP
 
 Lower limit of hashmap bit length. More than 8.
 
-_Source: `go/cagra/search_params.go:133`_
+_Source: `go/cagra/search_params.go:147`_
 
 ### SearchParams.SetHashmapMode
 
@@ -460,7 +510,7 @@ func (p *SearchParams) SetHashmapMode(hashmap_mode HashmapMode) (*SearchParams, 
 
 Hashmap type. Auto selection when AUTO.
 
-_Source: `go/cagra/search_params.go:113`_
+_Source: `go/cagra/search_params.go:127`_
 
 ### SearchParams.SetItopkSize
 
@@ -472,7 +522,7 @@ Number of intermediate search results retained during the search.
 This is the main knob to adjust trade off between accuracy and search speed.
 Higher values improve the search accuracy
 
-_Source: `go/cagra/search_params.go:55`_
+_Source: `go/cagra/search_params.go:69`_
 
 ### SearchParams.SetMaxIterations
 
@@ -482,7 +532,7 @@ func (p *SearchParams) SetMaxIterations(max_iterations uintptr) (*SearchParams, 
 
 Upper limit of search iterations. Auto select when 0.
 
-_Source: `go/cagra/search_params.go:61`_
+_Source: `go/cagra/search_params.go:75`_
 
 ### SearchParams.SetMaxQueries
 
@@ -492,7 +542,7 @@ func (p *SearchParams) SetMaxQueries(max_queries uintptr) (*SearchParams, error)
 
 Maximum number of queries to search at the same time (batch size). Auto select when 0
 
-_Source: `go/cagra/search_params.go:47`_
+_Source: `go/cagra/search_params.go:61`_
 
 ### SearchParams.SetMinIterations
 
@@ -502,7 +552,7 @@ func (p *SearchParams) SetMinIterations(min_iterations uintptr) (*SearchParams, 
 
 Lower limit of search iterations.
 
-_Source: `go/cagra/search_params.go:95`_
+_Source: `go/cagra/search_params.go:109`_
 
 ### SearchParams.SetNumRandomSamplings
 
@@ -512,7 +562,27 @@ func (p *SearchParams) SetNumRandomSamplings(num_random_samplings uint32) (*Sear
 
 Number of iterations of initial random seed node selection. 1 or more.
 
-_Source: `go/cagra/search_params.go:145`_
+_Source: `go/cagra/search_params.go:159`_
+
+### SearchParams.SetQueryBitsets
+
+```go
+func (p *SearchParams) SetQueryBitsets(query_bitsets uintptr) (*SearchParams, error)
+```
+
+One bitset per query for a filtered MULTI_CTA search. No per-query bitsets when 0.
+Otherwise the device address of an array with one pointer per query, each to the 32-bit words
+of that query's own bitset over the index's rows (bit i % 32 of word i / 32 is set when row i
+passes), on the device being searched. A null pointer leaves that query unfiltered.
+The search must still be given a non-nil allowList. Its bitset is then not read, so queries
+with different filters can share one search call.
+The filtering rate must be given unless the filter expansion is FilterExpansionPassingTwoHop,
+and the algo must be SearchAlgoMultiCta or SearchAlgoAuto, which then selects it.
+The address is stored as given and used by every search with these params. SearchParams does
+not own the array or the bitsets: they must stay valid until the search's work on the stream
+has finished (see Resource.Sync).
+
+_Source: `go/cagra/search_params.go:208`_
 
 ### SearchParams.SetRandXorMask
 
@@ -522,7 +592,7 @@ func (p *SearchParams) SetRandXorMask(rand_xor_mask uint64) (*SearchParams, erro
 
 Bit mask used for initial random seed node selection.
 
-_Source: `go/cagra/search_params.go:151`_
+_Source: `go/cagra/search_params.go:165`_
 
 ### SearchParams.SetSearchWidth
 
@@ -532,7 +602,7 @@ func (p *SearchParams) SetSearchWidth(search_width uintptr) (*SearchParams, erro
 
 How many nodes to search at once. Auto select when 0.
 
-_Source: `go/cagra/search_params.go:101`_
+_Source: `go/cagra/search_params.go:115`_
 
 ### SearchParams.SetTeamSize
 
@@ -542,7 +612,7 @@ func (p *SearchParams) SetTeamSize(team_size uintptr) (*SearchParams, error)
 
 Number of threads used to calculate a single distance. 4, 8, 16, or 32.
 
-_Source: `go/cagra/search_params.go:89`_
+_Source: `go/cagra/search_params.go:103`_
 
 ### SearchParams.SetThreadBlockSize
 
@@ -552,7 +622,7 @@ func (p *SearchParams) SetThreadBlockSize(thread_block_size uintptr) (*SearchPar
 
 Thread block size. 0, 64, 128, 256, 512, 1024. Auto selection when 0.
 
-_Source: `go/cagra/search_params.go:107`_
+_Source: `go/cagra/search_params.go:121`_
 
 ### StandardDatasetView.Close
 

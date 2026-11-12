@@ -31,6 +31,25 @@ enum class search_algo {
 | `MULTI_KERNEL` | `2` |
 | `AUTO` | `100` |
 
+<a id="neighbors-cagra-filter-expansion-mode"></a>
+### neighbors::cagra::filter_expansion_mode
+
+How a MULTI_CTA search walks the graph when a sample filter is given.
+
+```cpp
+enum class filter_expansion_mode {
+  SCORE_ALL = 0,
+  PASSING_TWO_HOP = 1
+};
+```
+
+**Values**
+
+| Name | Value |
+| --- | --- |
+| `SCORE_ALL` | `0` |
+| `PASSING_TWO_HOP` | `1` |
+
 ## CAGRA index build parameters
 
 <a id="neighbors-vpq-params"></a>

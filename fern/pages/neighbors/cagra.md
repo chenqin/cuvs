@@ -744,7 +744,7 @@ fn export_cagra_as_hnswlib(dataset: &ndarray::Array2<f32>) -> Result<()> {
 
 CAGRA supports filtered search. A filter hides some vectors from the search result, so CAGRA may need to explore more of the graph to find enough valid neighbors.
 
-CAGRA can adjust `itopk_size` internally based on the filtering rate. To disable this automatic adjustment, set `filtering_rate` to `0.0`.
+CAGRA can adjust `itopk_size` internally based on the filtering rate. To disable this automatic adjustment in C++, set `filtering_rate` to `0.0`. In the C API and the language bindings built on it, `0` selects the automatic rate; pass the known rate instead. When a filter removes most of the index, see [Filter expansion](#filter-expansion) for a search that only scores and expands vectors the filter passes.
 
 The examples below use a bitset filter. A bit value of `1` means a vector is allowed; a bit value of `0` means it is filtered out.
 
@@ -948,6 +948,161 @@ if err != nil {
 </Tab>
 </Tabs>
 
+### Filter expansion
+
+By default, a filtered search scores every neighbor of each vertex it visits, whether or not that neighbor passes the filter, and removes the filtered-out vectors from the result. With `MULTI_CTA`, CAGRA lengthens `itopk_size` by the filtering rate to make up for the candidates it will drop. When a filter removes most of the index, nearly all of the distance computations are then spent on vectors that cannot be returned.
+
+`filter_expansion` selects how the `MULTI_CTA` algorithm walks the graph when a filter is given. `PASSING_TWO_HOP` selects `MULTI_CTA` when `algo` is `AUTO`; the other algorithms ignore it. The C API's default `algo` is `SINGLE_CTA`, so set `algo` there.
+
+| Value | Behavior |
+| --- | --- |
+| `SCORE_ALL` (default) | Every neighbor is scored and can be expanded in turn. Filtered-out vectors are dropped from the result. |
+| `PASSING_TWO_HOP` | Only vectors that pass the filter are scored, kept, and expanded. A filtered-out neighbor is not scored; its own neighbors are examined instead, so the candidates of a vertex are its passing neighbors and the passing neighbors of its filtered-out neighbors, up to about `graph_degree` of them per expansion. |
+
+With `PASSING_TWO_HOP`:
+
+- The search starts from random vectors that pass the filter. For each starting slot, `num_random_samplings` of them are drawn and the nearest is kept, so a larger value starts the search closer to the query.
+- `itopk_size` is not lengthened, and the filtering rate is neither needed nor computed. The work a query does no longer depends on the filtering rate: it is set by the same parameters as an unfiltered `MULTI_CTA` search (`itopk_size`, `search_width`, `max_iterations`) and by `num_random_samplings`.
+- It suits filters that remove most of the index, and is most effective when the vectors a filter passes are near each other. If so few vectors pass that none lies within two hops of another (fewer than about one vector in `graph_degree * graph_degree`), the search cannot leave its starting points; run an exact search over the passing vectors instead. For the same reason, a passing vector that stands alone among filtered-out vectors, such as a false positive of a bloom filter, is found only when the search starts on it.
+- Multi-partition search always uses `SCORE_ALL`.
+
+<Tabs>
+<Tab title="C">
+
+```c
+cuvsCagraSearchParamsCreate(&search_params);
+search_params->algo = MULTI_CTA;
+search_params->filter_expansion = CUVS_CAGRA_FILTER_PASSING_TWO_HOP;
+
+cuvsCagraSearch(res, search_params, index, queries, neighbors, distances, filter);
+```
+
+</Tab>
+<Tab title="C++">
+
+```cpp
+cagra::search_params search_params;
+search_params.algo             = cagra::search_algo::MULTI_CTA;
+search_params.filter_expansion = cagra::filter_expansion_mode::PASSING_TWO_HOP;
+
+cagra::search(res, search_params, index, queries, neighbors, distances, bitset_filter);
+```
+
+</Tab>
+<Tab title="Python">
+
+```python
+search_params = cagra.SearchParams(
+    algo="multi_cta",
+    filter_expansion="passing_two_hop",
+)
+
+distances, neighbors = cagra.search(
+    search_params,
+    index,
+    queries,
+    k,
+    filter=prefilter,
+)
+```
+
+</Tab>
+<Tab title="Java">
+
+```java
+CagraSearchParams searchParams =
+    new CagraSearchParams.Builder()
+        .withAlgo(CagraSearchParams.SearchAlgo.MULTI_CTA)
+        .withFilterExpansion(CagraSearchParams.FilterExpansion.PASSING_TWO_HOP)
+        .build();
+```
+
+</Tab>
+<Tab title="Rust">
+
+```rust
+use cuvs::neighbors::cagra::{FilterExpansion, SearchAlgo, SearchParams};
+
+let search_params = SearchParams::builder()
+    .algo(SearchAlgo::MultiCta)
+    .filter_expansion(FilterExpansion::PassingTwoHop)
+    .build()?;
+
+index.search_filtered(res, &search_params, &queries, &mut neighbors, &mut distances, &filter)?;
+```
+
+</Tab>
+<Tab title="Go">
+
+```go
+searchParams, err := cagra.CreateSearchParams()
+if err != nil {
+	return err
+}
+defer searchParams.Close()
+
+if _, err = searchParams.SetAlgo(cagra.SearchAlgoMultiCta); err != nil {
+	return err
+}
+if _, err = searchParams.SetFilterExpansion(cagra.FilterExpansionPassingTwoHop); err != nil {
+	return err
+}
+```
+
+</Tab>
+</Tabs>
+
+### One bitset per query
+
+A bitset filter applies the same bitset to every query of a search call. When the queries of a batch have different filters, `query_bitsets` lets them share one `MULTI_CTA` search call. It is a device array with one pointer per query, each to the 32-bit words of that query's own bitset over the indexed vectors. As in a bitset filter, bit `i % 32` of word `i / 32` is set when vector `i` is allowed. Queries may share a bitset, and a null pointer leaves a query unfiltered.
+
+- Pass a bitset filter to the search call as usual. It selects the filtered search, but its own bitset is not read.
+- The array must hold a pointer for every query of the call.
+- `algo` must be `MULTI_CTA`, or `AUTO`, which then selects it. The search fails with any other algorithm, and multi-partition search, tiered-index search and dynamic batching do not accept `query_bitsets`.
+- Set `filter_expansion` to `PASSING_TWO_HOP`, or give `filtering_rate`: a rate is not computed from per-query bitsets.
+- The pointer array and every bitset it points to must stay valid until the search has finished its work on the stream.
+
+<Tabs>
+<Tab title="C">
+
+```c
+// `bitset_pointers` is a device array of n_queries pointers, each to the uint32
+// words of one query's bitset on the same device.
+search_params->algo = MULTI_CTA;
+search_params->filter_expansion = CUVS_CAGRA_FILTER_PASSING_TWO_HOP;
+search_params->query_bitsets = (uintptr_t)bitset_pointers;
+
+// `filter` is a BITSET filter over the index, as for any filtered search.
+cuvsCagraSearch(res, search_params, index, queries, neighbors, distances, filter);
+```
+
+</Tab>
+<Tab title="C++">
+
+```cpp
+// One bitset per distinct filter, and for each query the device address of its bitset's words.
+std::vector<uintptr_t> pointers_host(n_queries);
+for (int64_t i = 0; i < n_queries; i++) {
+  pointers_host[i] = reinterpret_cast<uintptr_t>(bitsets[filter_of_query[i]].data());
+}
+auto pointers = raft::make_device_vector<uintptr_t, int64_t>(res, n_queries);
+raft::copy(pointers.data_handle(),
+           pointers_host.data(),
+           n_queries,
+           raft::resource::get_cuda_stream(res));
+
+cagra::search_params search_params;
+search_params.algo             = cagra::search_algo::MULTI_CTA;
+search_params.filter_expansion = cagra::filter_expansion_mode::PASSING_TWO_HOP;
+search_params.query_bitsets    = reinterpret_cast<const uint32_t* const*>(pointers.data_handle());
+
+auto bitset_filter = cuvs::neighbors::filtering::bitset_filter(bitsets[0].view());
+cagra::search(res, search_params, index, queries, neighbors, distances, bitset_filter);
+```
+
+</Tab>
+</Tabs>
+
 ### C++ filter UDFs
 
 CAGRA C++ search can also use a JIT-LTO filter UDF when the predicate needs device metadata such as per-row tenants, ACLs, timestamps, or query-specific attributes. The UDF is a candidate-validity predicate: it decides whether a logical `source_id` is allowed for a logical `query_id`. It cannot control graph traversal, access PQ/VPQ or graph internals, or change distance computation.
@@ -1052,7 +1207,9 @@ The product of that value and `leaf_degree` must not exceed `255`. Fanouts must 
 | `persistent` | `False` | Uses the persistent search kernel where supported. Currently this applies only to `SINGLE_CTA`. |
 | `persistent_lifetime` | `2.0` | Seconds before a persistent kernel stops when no requests are received. |
 | `persistent_device_usage` | `1.0` | Fraction of the maximum grid size used by the persistent kernel. Lower values can leave GPU capacity for other work. |
-| `filtering_rate` | `-1.0` | Expected fraction of nodes filtered out during filtered search. Negative values let NVIDIA cuVS estimate it automatically. |
+| `filtering_rate` | `-1.0` | Expected fraction of nodes filtered out during filtered search. Negative values let NVIDIA cuVS estimate it automatically. In the C API and the language bindings built on it, the default is `0`, which also means automatic. |
+| `filter_expansion` | `SCORE_ALL` | How a filtered `MULTI_CTA` search walks the graph. `SCORE_ALL` scores every neighbor and drops filtered-out vectors from the result; `PASSING_TWO_HOP` scores and expands only vectors that pass the filter. See [Filter expansion](#filter-expansion). |
+| `query_bitsets` | null | Device array with one bitset pointer per query, for `MULTI_CTA` searches whose queries have different bitset filters. See [One bitset per query](#one-bitset-per-query). |
 
 ## Tuning
 

@@ -96,6 +96,23 @@ Hash-table mode used during search.
 
 _Source: `rust/cuvs/src/neighbors/cagra/mod.rs:110`_
 
+## FilterExpansion
+
+```rust
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FilterExpansion {
+    /* variants omitted */
+}
+```
+
+How a filtered [`SearchAlgo::MultiCta`] search walks the graph.
+
+With [`FilterExpansion::PassingTwoHop`], [`SearchAlgo::Auto`] selects
+[`SearchAlgo::MultiCta`]. Other search algorithms ignore it.
+
+_Source: `rust/cuvs/src/neighbors/cagra/mod.rs:145`_
+
 ## CagraError
 
 ```rust
@@ -108,4 +125,4 @@ pub enum CagraError {
 
 Error type for CAGRA operations.
 
-_Source: `rust/cuvs/src/neighbors/cagra/mod.rs:142`_
+_Source: `rust/cuvs/src/neighbors/cagra/mod.rs:179`_

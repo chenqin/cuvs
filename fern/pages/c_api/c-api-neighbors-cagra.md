@@ -549,6 +549,25 @@ enum cuvsCagraHashMode {
 | `SMALL` | `1` |
 | `AUTO_HASH` | `100` |
 
+<a id="cuvscagrafilterexpansion"></a>
+### cuvsCagraFilterExpansion
+
+How a MULTI_CTA search walks the graph when a filter is given
+
+```c
+enum cuvsCagraFilterExpansion {
+  CUVS_CAGRA_FILTER_SCORE_ALL = 0,
+  CUVS_CAGRA_FILTER_PASSING_TWO_HOP = 1
+};
+```
+
+**Values**
+
+| Name | Value |
+| --- | --- |
+| `CUVS_CAGRA_FILTER_SCORE_ALL` | `0` |
+| `CUVS_CAGRA_FILTER_PASSING_TWO_HOP` | `1` |
+
 <a id="cuvscagrasearchparams"></a>
 ### cuvsCagraSearchParams
 
@@ -572,6 +591,9 @@ struct cuvsCagraSearchParams {
   bool persistent;
   float persistent_lifetime;
   float persistent_device_usage;
+  float filtering_rate;
+  enum cuvsCagraFilterExpansion filter_expansion;
+  uintptr_t query_bitsets;
 };
 ```
 
@@ -595,6 +617,9 @@ struct cuvsCagraSearchParams {
 | `persistent` | `bool` | Whether to use the persistent version of the kernel (only SINGLE_CTA is supported a.t.m.) |
 | `persistent_lifetime` | `float` | Persistent kernel: time in seconds before the kernel stops if no requests received. |
 | `persistent_device_usage` | `float` | Set the fraction of maximum grid size used by persistent kernel. Value 1.0 means the kernel grid size is maximum possible for the selected device. The value must be greater than 0.0 and not greater than 1.0.<br /><br />One may need to run other kernels alongside this persistent kernel. This parameter can be used to reduce the grid size of the persistent kernel to leave a few SMs idle.<br />Note: running any other work on GPU alongside with the persistent kernel makes the setup fragile.<br />- Running another kernel in another thread usually works, but no progress guaranteed<br />- Any CUDA allocations block the context (this issue may be obscured by using pools)<br />- Memory copies to not-pinned host memory may block the context<br /><br />Even when we know there are no other kernels working at the same time, setting kDeviceUsage to 1.0 surprisingly sometimes hurts performance. Proceed with care. If you suspect this is an issue, you can reduce this number to ~0.9 without a significant impact on the throughput. |
+| `filtering_rate` | `float` | Fraction of the index's rows the filter removes, greater than 0 and less than 1. When it is 0, as it is by default, each search that needs the rate computes it from the filter, which reads the whole bitset and waits for the result. |
+| `filter_expansion` | [`enum cuvsCagraFilterExpansion`](/api-reference/c-api-neighbors-cagra#cuvscagrafilterexpansion) | How a filtered MULTI_CTA search walks the graph. CUVS_CAGRA_FILTER_PASSING_TWO_HOP selects MULTI_CTA when `algo` is AUTO; the other algorithms and cuvsCagraSearchMultiPartition ignore it. |
+| `query_bitsets` | `uintptr_t` | MULTI_CTA with a BITSET filter: when not 0, the device address of an array with one pointer per query, each to the 32-bit words of that query's own bitset over the index's rows (bit `i % 32` of word `i / 32` is set when row `i` passes), on the device being searched. The filter's own bitset is then not read, so queries with different filters can share one search call. A null pointer leaves that query unfiltered. The array must hold a pointer for every query of the call. `filtering_rate` must be given unless `filter_expansion` is CUVS_CAGRA_FILTER_PASSING_TWO_HOP. `algo` must be MULTI_CTA or AUTO. Multi-partition and tiered-index search do not take it. The array and the bitsets must stay valid until the search's work on the stream has finished. |
 
 <a id="cuvscagrasearchparamscreate"></a>
 ### cuvsCagraSearchParamsCreate
