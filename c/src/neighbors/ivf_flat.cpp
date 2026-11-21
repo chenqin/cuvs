@@ -107,7 +107,7 @@ void _search(cuvsResources_t res,
                                       bitset_filter_obj);
 
   } else {
-    RAFT_FAIL("Unsupported filter type: BITMAP");
+    RAFT_FAIL("Unsupported filter type: %d", (int)filter.type);
   }
 }
 
