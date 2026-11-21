@@ -90,6 +90,22 @@ inline constexpr char const* kGraphOnlyDatasetMessage =
   "CAGRA indexes with a quantized dataset store only the graph; serialize the quantized dataset "
   "separately and reattach it with update_dataset()";
 
+/**
+ * Whether the index has rows and no graph (a dataset and an empty graph, which only the FP8
+ * filtered scan of CAGRA search can search). Such an index has no graph to write, and writing it
+ * would store a graph of 0 rows for its rows.
+ */
+template <typename CagraIndexT>
+[[nodiscard]] auto has_rows_and_no_graph(CagraIndexT const& index_) -> bool
+{
+  return index_.size() > 0 && index_.graph().extent(0) == 0 && !index_.graph_fd().has_value() &&
+         !index_.dataset_fd().has_value();
+}
+
+inline constexpr char const* kNoGraphMessage =
+  "Cannot serialize a CAGRA index without a graph: the index has no graph, only rows for the FP8 "
+  "filtered scan";
+
 template <typename MdspanT>
 void serialize_index_mdspan(raft::resources const& res, std::ostream& os, MdspanT const& mdspan)
 {
@@ -118,6 +134,7 @@ void serialize(raft::resources const& res,
                "Cannot serialize a disk-backed CAGRA index. Convert it with "
                "cuvs::neighbors::hnsw::from_cagra() and load it into memory via "
                "cuvs::neighbors::hnsw::deserialize() before serialization.");
+  RAFT_EXPECTS(!has_rows_and_no_graph(index_), kNoGraphMessage);
 
   RAFT_LOG_DEBUG(
     "Saving CAGRA index, size %zu, dim %u", static_cast<size_t>(index_.size()), index_.dim());
@@ -177,6 +194,7 @@ void serialize(raft::resources const& res,
                "Cannot serialize a disk-backed CAGRA index. Convert it with "
                "cuvs::neighbors::hnsw::from_cagra() and load it into memory via "
                "cuvs::neighbors::hnsw::deserialize() before serialization.");
+  RAFT_EXPECTS(!has_rows_and_no_graph(index_), kNoGraphMessage);
   cuvs::util::kvikio_ofstream of(filename);
 
   detail::serialize(res, of, index_, include_dataset);
@@ -507,6 +525,7 @@ void serialize_to_hnswlib(
 {
   static_assert(is_cagra_hnsw_serialize_index_v<T, IdxT, CagraIndexT>,
                 "serialize_to_hnswlib requires a dense device or host padded CAGRA index");
+  RAFT_EXPECTS(!has_rows_and_no_graph(index_), kNoGraphMessage);
 
   int const dim = dataset ? dataset->extent(1) : index_.dim();
   raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope("cagra::serialize");
@@ -528,6 +547,7 @@ void serialize_to_hnswlib(
 {
   static_assert(is_cagra_hnsw_serialize_index_v<T, IdxT, CagraIndexT>,
                 "serialize_to_hnswlib requires a dense device or host padded CAGRA index");
+  RAFT_EXPECTS(!has_rows_and_no_graph(index_), kNoGraphMessage);
 
   int const dim = dataset ? dataset->extent(1) : index_.dim();
   raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope("cagra::serialize");
