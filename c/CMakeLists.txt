@@ -106,6 +106,7 @@ add_library(
   src/preprocessing/quantize/bbq.cpp
   src/preprocessing/quantize/pq.cpp
   src/preprocessing/quantize/scalar.cpp
+  src/preprocessing/quantize/fp8.cpp
   src/distance/pairwise_distance.cpp
   src/selection/select_k.cpp
 )
