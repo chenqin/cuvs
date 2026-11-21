@@ -43,6 +43,7 @@ These pages are generated from the documented public headers in the cuVS source 
 
 - [Bbq](/api-reference/c-api-preprocessing-quantize-bbq)
 - [Binary](/api-reference/c-api-preprocessing-quantize-binary)
+- [Fp8](/api-reference/c-api-preprocessing-quantize-fp8)
 - [PCA](/api-reference/c-api-preprocessing-pca)
 - [PQ](/api-reference/c-api-preprocessing-quantize-pq)
 - [Scalar](/api-reference/c-api-preprocessing-quantize-scalar)

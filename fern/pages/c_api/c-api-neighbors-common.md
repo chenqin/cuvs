@@ -17,7 +17,8 @@ Enum to denote filter type.
 enum cuvsFilterType {
   NO_FILTER = 0,
   BITSET = 1,
-  BITMAP = 2
+  BITMAP = 2,
+  ROW_LIST = 3
 };
 ```
 
@@ -28,6 +29,7 @@ enum cuvsFilterType {
 | `NO_FILTER` | `0` |
 | `BITSET` | `1` |
 | `BITMAP` | `2` |
+| `ROW_LIST` | `3` |
 
 <a id="cuvsfilter"></a>
 ### cuvsFilter

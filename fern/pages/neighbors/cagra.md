@@ -1103,6 +1103,68 @@ cagra::search(res, search_params, index, queries, neighbors, distances, bitset_f
 </Tab>
 </Tabs>
 
+### Filtered scan
+
+A filter that passes a small share of the index makes a graph walk spend most of its work on vectors it cannot return. When an FP16 index also holds FP8 codes of its vectors, a search can scan the vectors the filter passes instead: each of them is scored once from its codes, for all the queries of the call at once, each query keeps `scan_candidates` of them, and those are re-scored from the index's FP16 vectors. The cost is one pass over the passing vectors, shared by the whole call, so it falls as the filter narrows. The filtered scan is available in the C and C++ APIs.
+
+- Encode the vectors with `cuvs::preprocessing::quantize::fp8`: `fp8::quantizer` allocates the codes of `n` vectors (E4M3 codes, `fp8::get_encoded_row_length(dim)` bytes a vector, which is the dimension rounded up to 16, and one FP32 scale per vector), and `fp8::transform` fills them. In C, `cuvsFp8QuantizerTransform` writes the same layout into tensors the caller allocates, and `cuvsFp8QuantizerEncodedRowLength` gives the row width. Codes from any other producer of this layout work as well.
+- Attach the codes with `index.update_scan_codes(res, codes.view())`, or `cuvsCagraUpdateScanCodes(res, codes, row_scales, index)` in C, which takes FP16 indexes with a device padded dataset and detaches the codes when `codes` is `NULL` (`reset_scan_codes` in C++). The index keeps a view: the codes must stay alive and unchanged while it is searched. They are not serialized, and a new dataset drops them: `extend`, `update_dataset` and deserializing give an index without codes, so attach them again afterwards.
+- `filtered_route` chooses the route. `AUTO`, the default, scans when the scan can run the search, a filter is given, and at most `scan_max_pass_rate` of the vectors pass it; otherwise it walks the graph. An index without codes always walks the graph, so its searches are unchanged. `SCAN` always scans, and fails, saying why, when the scan cannot run; without a filter it scans every vector. `GRAPH` never scans. In C the values are `CUVS_CAGRA_FILTERED_ROUTE_GRAPH`, `CUVS_CAGRA_FILTERED_ROUTE_SCAN` and `CUVS_CAGRA_FILTERED_ROUTE_AUTO`: `cuvsCagraSearchParamsCreate` sets `AUTO`, and a zeroed `cuvsCagraSearchParams` means `GRAPH`.
+- The scan can run a search when the index holds FP16 vectors densely in device memory and has codes for every vector; the metric is `L2Expanded` or `L2Unexpanded`, the dimension at most 512 and `k` from 1 to 4096; the index has no source indices and the search no `query_bitsets` (the queries of a scan share one filter); the filter is a bitset filter over at least the index's vectors, a row list filter, or none; and the cuVS build holds scan kernels for the GPU, which needs a kernel image for compute capability 8.9 or newer. When any of these fails, `AUTO` walks the graph, as it does when the scan runs out of memory.
+- `scan_max_pass_rate` is a share of passing vectors, the opposite of `filtering_rate`, which is the share filtered out. `AUTO` takes the share from the length of a row list, else from `filtering_rate` when it is given, else by counting the bitset on the GPU, which it does only for an index with codes and when every other condition holds. When the count leads to the graph walk, it stands for the filtering rate the walk would otherwise compute.
+- A row list filter gives the passing vectors as a device array of `uint32` vector numbers, each below the index's size and each once: `cuvs::neighbors::filtering::row_list_filter` in C++, and in C a `ROW_LIST` `cuvsFilter` whose `addr` is a 1-D `uint32` device tensor. It works on both routes: the scan reads the list directly, and a search that walks the graph turns it into a bitset first. It suits callers that hold the passing vectors as a list already.
+- `scan_skip_last_block` is the caller's claim that the last 16-dimension block of the codes and of the queries holds one coordinate with the same value in every vector and every query, as unit vectors augmented for cosine as L2 have when the dimension is one more than a multiple of 16. The scan then leaves that block out of its FP8 distances, which keeps their order, and the re-scoring restores the exact distances. A wrong claim changes which candidates the scan keeps.
+- Over many passing vectors, the scan keeps each query's candidates under a cutoff estimated from a sample of them, and checks on the host that the cutoff kept a workable number; where it did not, it selects again from all of them. That check waits for the GPU in the middle of the search, as does turning a bitset into the list of vectors the scan reads. With `scan_retry`, the scan writes the check's outcome per query to a device array instead and does not wait, and the caller searches the flagged queries again with `scan_full_selection`. A cutoff fails rarely (on data with many equal distances, for example). A search that walks the graph sets every flag to 0.
+- An index without a graph can be searched by the scan only. It holds a dataset and an empty graph: in C, from `cuvsCagraIndexFromArgs` with a `NULL` graph and a device dataset whose row width CAGRA takes as padded; in C++, an index constructed from a metric alone and given its dataset with `update_dataset`. With codes attached, `AUTO` scans its searches, filtered or not, and fails when the scan cannot run them. Walking the graph fails.
+- The scan returns vector numbers of the index and squared L2 distances. Slots past the vectors that pass hold `0xFFFFFFFF` (`4294967295` in an `int64` output) and the largest float distance. The graph search marks such slots with ids at or above the index size too, but not always with the same value, so treat any id at or above the index size as empty. Candidates kept from FP8 distances that tie at the cut can change from one call to the next, so the last results of a query can differ between identical calls.
+- Searches of several indexes or batches never scan: multi-partition search, composite indexes of several children, tiered indexes, dynamic batching and multi-GPU search walk the graph, and they refuse `SCAN`, `scan_retry` and a row list filter.
+- Memory: the codes take their row width in bytes per vector, plus 4 bytes for its scale, in memory the caller owns. A search with a bitset filter makes a list of 4 bytes per passing vector for the scan to read, and the scan's working buffers come from the workspace memory of the resources.
+
+<Tabs>
+<Tab title="C">
+
+```c
+// codes: a [n_rows, width] uint8 tensor and row_scales: a [n_rows] float32 tensor, both on the
+// device, with the width from cuvsFp8QuantizerEncodedRowLength(dim, &width).
+cuvsFp8QuantizerTransform(res, dataset, codes, row_scales);
+cuvsCagraUpdateScanCodes(res, codes, row_scales, index);
+
+search_params->filtered_route = CUVS_CAGRA_FILTERED_ROUTE_SCAN;
+search_params->scan_candidates = 4 * k;
+
+// rows: a 1-D uint32 device tensor of the vectors that pass.
+cuvsFilter filter = {.addr = (uintptr_t)rows, .type = ROW_LIST};
+cuvsCagraSearch(res, search_params, index, queries, neighbors, distances, filter);
+```
+
+</Tab>
+<Tab title="C++">
+
+```cpp
+#include <cuvs/preprocessing/quantize/fp8.hpp>
+
+namespace fp8 = cuvs::preprocessing::quantize::fp8;
+fp8::quantizer codes(res, n_rows, dim);
+fp8::transform(res, dataset, codes);
+index.update_scan_codes(res, codes.view());
+
+cagra::search_params search_params;
+search_params.filtered_route  = cagra::filtered_route_mode::SCAN;
+search_params.scan_candidates = 4 * k;
+
+// rows: a raft::device_vector_view<const uint32_t, int64_t> of the vectors that pass.
+cagra::search(res,
+              search_params,
+              index,
+              queries,
+              neighbors,
+              distances,
+              cuvs::neighbors::filtering::row_list_filter(rows));
+```
+
+</Tab>
+</Tabs>
+
 ### C++ filter UDFs
 
 CAGRA C++ search can also use a JIT-LTO filter UDF when the predicate needs device metadata such as per-row tenants, ACLs, timestamps, or query-specific attributes. The UDF is a candidate-validity predicate: it decides whether a logical `source_id` is allowed for a logical `query_id`. It cannot control graph traversal, access PQ/VPQ or graph internals, or change distance computation.
@@ -1210,6 +1272,12 @@ The product of that value and `leaf_degree` must not exceed `255`. Fanouts must 
 | `filtering_rate` | `-1.0` | Expected fraction of nodes filtered out during filtered search. Negative values let NVIDIA cuVS estimate it automatically. In the C API and the language bindings built on it, the default is `0`, which also means automatic. |
 | `filter_expansion` | `SCORE_ALL` | How a filtered `MULTI_CTA` search walks the graph. `SCORE_ALL` scores every neighbor and drops filtered-out vectors from the result; `PASSING_TWO_HOP` scores and expands only vectors that pass the filter. See [Filter expansion](#filter-expansion). |
 | `query_bitsets` | null | Device array with one bitset pointer per query, for `MULTI_CTA` searches whose queries have different bitset filters. See [One bitset per query](#one-bitset-per-query). |
+| `filtered_route` | `AUTO` | Whether a search walks the graph (`GRAPH`) or runs the FP8 filtered scan of the passing vectors (`SCAN`); `AUTO` scans narrow filters on an index with scan codes. In the C API, a zeroed struct means `GRAPH`. See [Filtered scan](#filtered-scan). |
+| `scan_max_pass_rate` | `0.25` | `AUTO` scans when at most this share of the vectors pass the filter: a share that passes, unlike `filtering_rate`. In the C API, `0` takes the default. |
+| `scan_candidates` | `0` | Candidates per query the scan re-scores from FP16 vectors, from `k` to 4096. `0` takes `k + max(16, 3k)`. |
+| `scan_skip_last_block` | `false` | The caller's claim that the last 16-dimension block of the vectors and queries holds one coordinate with the same value everywhere: the scan then leaves that block out of its FP8 distances. |
+| `scan_retry` | null | Device array of one flag per query. When set, the scan does not wait on the GPU to check its sampled cutoff: it flags each query the cutoff failed (1), whose results are then not exact, for the caller to search again with `scan_full_selection`. Single-index `search` only: multi-partition, composite, tiered, dynamic batching and multi-GPU searches refuse it. |
+| `scan_full_selection` | `false` | Select from every vector the scan reads, without the sampled cutoff: slower, never flagged. |
 
 ## Tuning
 
