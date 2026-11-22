@@ -37,6 +37,13 @@ struct CagraMultiCtaSearchPlanner
         small ? "search_multi_cta_small" : "search_multi_cta",
         small ? launcher_jit_cache_small : launcher_jit_cache)
   {
+    // The kernel has no __launch_bounds__ (see search_multi_cta_kernel.cu.in): cap its registers at
+    // 64, what 1,024 threads a block allow, unless the environment set a cap.
+    bool capped = false;
+    for (const auto& option : this->linktime_extra_options) {
+      if (option.rfind("-maxrregcount", 0) == 0) { capped = true; }
+    }
+    if (!capped) { this->linktime_extra_options.push_back("-maxrregcount=64"); }
   }
 
   void add_search_multi_cta_kernel_fragment()
