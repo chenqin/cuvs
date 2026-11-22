@@ -71,6 +71,12 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
   const auto max_i = raft::round_up_safe<uint32_t>(num_pickup, device::warp_size >> team_size_bits);
   const uint32_t num_words =
     static_cast<uint32_t>((static_cast<uint64_t>(seed_index_limit) + 31) / 32);
+  // The word a random number picks: 32 of its bits above the low 8 scaled to [0, num_words) by a
+  // multiply-high (a 64-bit modulo here was a software division call in the SASS).
+  auto pick_word = [num_words](uint64_t r) -> uint32_t {
+    return static_cast<uint32_t>(
+      (static_cast<uint64_t>(static_cast<uint32_t>(r >> 8)) * num_words) >> 32);
+  };
 
   for (uint32_t i = threadIdx.x >> team_size_bits; i < max_i; i += (blockDim.x >> team_size_bits)) {
     const bool valid_i = (i < num_pickup);
@@ -94,7 +100,7 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
           if (filter_words != nullptr) {
             uint32_t word[kWide];
             for (uint32_t u = 0; u < kWide; u++) {
-              word[u] = filter_words[(r[u] >> 8) % num_words];
+              word[u] = filter_words[pick_word(r[u])];
             }
             for (uint32_t u = 0; u < kWide && seed_index == invalid_index; u++) {
               if (word[u] == 0) { continue; }
@@ -103,7 +109,7 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
               const uint32_t rot     = static_cast<uint32_t>(r[u]) & 31u;
               const uint32_t rotated = (word[u] >> rot) | (word[u] << ((32u - rot) & 31u));
               const uint32_t bit     = (static_cast<uint32_t>(__ffs(rotated)) - 1u + rot) & 31u;
-              const uint64_t node    = ((r[u] >> 8) % num_words) * 32ull + bit;
+              const uint64_t node    = static_cast<uint64_t>(pick_word(r[u])) * 32ull + bit;
               if (node < seed_index_limit) { seed_index = static_cast<IndexT>(node); }
             }
           } else {
@@ -227,7 +233,11 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
   constexpr uint32_t kSlotsPerRound = 256;  // slots per round for the thread block
   constexpr uint32_t kMaxUnroll     = 4;    // max slots per round for a thread
   const uint32_t num_slots          = knn_k * knn_k;
-  const uint32_t slots_per_thread   = kSlotsPerRound / blockDim.x;
+  // The slot's row and column by shifts when the degree is a power of two (knn_k is a runtime
+  // value, so s / knn_k was an emulated u32 divide, ~7% of the kernel's stall samples).
+  const bool degree_pow2          = (knn_k & (knn_k - 1)) == 0;
+  const uint32_t degree_shift     = static_cast<uint32_t>(__ffs(static_cast<int>(knn_k))) - 1u;
+  const uint32_t slots_per_thread = kSlotsPerRound / blockDim.x;
   const uint32_t unroll =
     slots_per_thread < 1 ? 1u : (slots_per_thread > kMaxUnroll ? kMaxUnroll : slots_per_thread);
   for (uint32_t s0 = threadIdx.x; s0 < num_slots; s0 += blockDim.x * unroll) {
@@ -235,9 +245,10 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
     IndexT child[kMaxUnroll];
     for (uint32_t u = 0; u < kMaxUnroll; u++) {
       const uint32_t s    = s0 + (blockDim.x * u);
-      const IndexT bridge = (u < unroll && s < num_slots) ? bridges[s / knn_k] : invalid_index;
+      const uint32_t row  = degree_pow2 ? (s >> degree_shift) : (s / knn_k);
+      const IndexT bridge = (u < unroll && s < num_slots) ? bridges[row] : invalid_index;
       child[u]            = (bridge != invalid_index)
-                              ? knn_graph[(s % knn_k) + (static_cast<int64_t>(knn_k) * bridge)]
+                              ? knn_graph[(s - row * knn_k) + (static_cast<int64_t>(knn_k) * bridge)]
                               : invalid_index;
     }
     if (filter_words != nullptr) {
