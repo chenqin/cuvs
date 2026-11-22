@@ -228,6 +228,13 @@ ConfigureTest(
 )
 
 ConfigureTest(
+  NAME CORE_POSTINGS_TEST
+  PATH core/postings.cu
+  GPUS 1
+  PERCENT 100
+)
+
+ConfigureTest(
   NAME CORE_ROARING_ALLOWLIST_TEST
   PATH neighbors/roaring_allowlist.cu
   ADDITIONAL_DEP cuco::cuco
