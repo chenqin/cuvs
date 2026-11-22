@@ -12,14 +12,14 @@
 # DATA_DIR/NAME.fbin (uint32 rows, uint32 dimension, float32 rows) becomes OUT_DIR/NAME/ with
 # graph.cagra (FP16 rows and graph: the two-hop walk), rows.f16 and codes.fp8 (the graph-free index
 # of the FP8 filtered scan; the codes also let a graph index choose the scan per search). A build of
-# 46.5 million 65-dimension rows takes about two minutes on a B200 and needs about 30 GB of device
-# memory. NGPUS overrides the number of GPUs used; a file whose OUT_DIR/NAME/codes.fp8 exists is
-# skipped, so the script can be run again after a failure.
+# 46.5 million 65-dimension rows takes about two minutes on a B200. NGPUS overrides the number of
+# GPUs used; a file whose OUT_DIR/NAME/codes.fp8 exists is skipped, so the script can be run again
+# after a failure.
 
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  sed -n '7,17p' "$0"
+  sed -n '6,17p' "$0"
   exit 2
 fi
 DATA_DIR=$1
