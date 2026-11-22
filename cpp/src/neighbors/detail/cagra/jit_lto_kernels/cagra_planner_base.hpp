@@ -13,7 +13,10 @@
 #include <rtcx/algorithm_planner.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -36,6 +39,21 @@ struct CagraPlannerBase : rtcx::algorithm_planner {
   explicit CagraPlannerBase(std::string entrypoint, rtcx::launcher_jit_cache& jit_cache)
     : rtcx::algorithm_planner(std::move(entrypoint), jit_cache)
   {
+    // Profiling and tuning: extra nvJitLink options for the CAGRA search kernels, space-separated,
+    // for every CAGRA entry point (CUVS_CAGRA_JIT_LINK_OPTIONS) and for one
+    // (CUVS_CAGRA_JIT_LINK_OPTIONS_<entrypoint>, e.g. _search_multi_cta), for example
+    // "-lineinfo" (with a -lineinfo build) or "-maxrregcount=40". Read once per process, since
+    // the launchers are cached by their fragments.
+    for (const std::string& name :
+         {std::string("CUVS_CAGRA_JIT_LINK_OPTIONS"),
+          std::string("CUVS_CAGRA_JIT_LINK_OPTIONS_") + this->entrypoint}) {
+      const char* options = std::getenv(name.c_str());
+      if (options == nullptr) { continue; }
+      std::istringstream words(options);
+      for (std::string option; words >> option;) {
+        this->linktime_extra_options.push_back(option);
+      }
+    }
   }
 
   /// Standard codebook: workspace fragments always use `pq_bits=0`, `pq_len=0`.
