@@ -1470,6 +1470,7 @@ if(NOT BUILD_CPU_ONLY)
     src/core/bitset.cu
     src/core/bloom_filter.cu
     src/core/roaring_allowlist.cu
+    src/core/postings.cu
     src/neighbors/roaring_bitmap_filter.cu
     src/core/omp_wrapper.cpp
     src/util/file_io.cpp

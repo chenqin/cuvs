@@ -1165,6 +1165,26 @@ cagra::search(res,
 </Tab>
 </Tabs>
 
+### Bitset filters from postings lists
+
+When the attributes a filter reads are kept as postings lists (for each value, the rows that hold it), `cuvs::core::postings::evaluate` (`cuvsPostingsEvaluate` in C) builds the filter's bitset on the GPU from the lists, without reading the attribute of every row. A filter is a postfix program: each leaf is the union of runs of a list (the rows of one value, or of a range of values, which are adjacent in the list), optionally complemented and then less the rows of one more run; `AND`, `OR`, `NOT`, `ALL` and `NONE` combine them. The work is proportional to the rows the leaves name plus one pass over the bitset per step, so a filter that names a few thousand rows of a 46-million-row index is built in tens of microseconds. The caller plans the program from its sorted values: a leaf that names most rows of a single-valued attribute is cheaper as the complement of the other values' runs, and a negated comparison that must not pass rows whose value is NULL excludes the NULL value's run.
+
+The bitset can cover a window of rows (`first_row`, and the bitset's size), as for one shard of a partitioned index; rows of the lists outside the window are ignored. Everything runs on the stream of the resources, with no wait, so a bitset built just before the search that reads it costs no synchronization. `workspace_size` gives the scratch a program needs; pass a workspace that outlives several calls to avoid an allocation per call.
+
+```cpp
+#include <cuvs/core/postings.hpp>
+
+namespace postings = cuvs::core::postings;
+// lists: the postings lists on the device; runs: (list, offset, count) of the values a leaf names.
+std::vector<postings::run> runs = {{0, offset_of_3, count_of_3}, {0, offset_of_7, count_of_7}};
+std::vector<postings::step> program(1);
+program[0] = {postings::step_kind::LEAF, 0, 2};  // value 3 or 7
+postings::evaluate(res, raft::make_const_mdspan(host_program), raft::make_const_mdspan(host_runs),
+                   raft::make_const_mdspan(host_lists), bitset.view());
+cagra::search(res, search_params, index, queries, neighbors, distances,
+              cuvs::neighbors::filtering::bitset_filter(bitset.view()));
+```
+
 ### C++ filter UDFs
 
 CAGRA C++ search can also use a JIT-LTO filter UDF when the predicate needs device metadata such as per-row tenants, ACLs, timestamps, or query-specific attributes. The UDF is a candidate-validity predicate: it decides whether a logical `source_id` is allowed for a logical `query_id`. It cannot control graph traversal, access PQ/VPQ or graph internals, or change distance computation.

@@ -76,6 +76,7 @@ endfunction()
 
 ConfigureTest(NAME INTEROP_TEST PATH core/interop.cu)
 ConfigureTest(NAME DATASET_C_TEST PATH core/dataset_c.cu)
+ConfigureTest(NAME POSTINGS_C_TEST PATH core/postings_c.cu)
 ConfigureTest(
   NAME DISTANCE_C_TEST PATH distance/run_pairwise_distance_c.c distance/pairwise_distance_c.cu
 )
