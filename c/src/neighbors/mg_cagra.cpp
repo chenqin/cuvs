@@ -175,12 +175,6 @@ void convert_c_mg_search_params(
   cuvs::neighbors::mg_search_params<cuvs::neighbors::cagra::search_params>* out)
 {
   convert_c_search_params(*params.base_params, out);
-  // Multi-GPU search walks the graph on every rank: the FP8 filtered scan searches one index.
-  RAFT_EXPECTS(out->filtered_route != cuvs::neighbors::cagra::filtered_route_mode::SCAN,
-               "cuvsMultiGpuCagraSearch: filtered_route CUVS_CAGRA_FILTERED_ROUTE_SCAN is not "
-               "supported");
-  RAFT_EXPECTS(out->scan_retry == nullptr, "cuvsMultiGpuCagraSearch: scan_retry is not supported");
-  out->filtered_route   = cuvs::neighbors::cagra::filtered_route_mode::GRAPH;
   out->search_mode      = (params.search_mode == CUVS_NEIGHBORS_MG_LOAD_BALANCER)
                             ? cuvs::neighbors::replicated_search_mode::LOAD_BALANCER
                             : cuvs::neighbors::replicated_search_mode::ROUND_ROBIN;

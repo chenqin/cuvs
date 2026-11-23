@@ -374,12 +374,6 @@ void search_multi_partition(
   RAFT_EXPECTS(params.query_bitsets == nullptr,
                "search_params::query_bitsets is not supported by multi-partition search");
   params.filter_expansion = filter_expansion_mode::SCORE_ALL;
-  // The FP8 filtered scan searches one index: partitions always walk their graphs.
-  RAFT_EXPECTS(params.filtered_route != filtered_route_mode::SCAN,
-               "search_params::filtered_route SCAN is not supported by multi-partition search");
-  RAFT_EXPECTS(params.scan_retry == nullptr,
-               "search_params::scan_retry is not supported by multi-partition search");
-  params.filtered_route = filtered_route_mode::GRAPH;
 
   // The index type in this signature pins the dataset view to the default, so every partition is
   // statically known to hold a padded (non-compressed) device dataset.
@@ -404,11 +398,6 @@ void search_multi_partition(
   for (uint32_t i = 0; i < num_partitions; i++) {
     RAFT_EXPECTS(!indices[i]->dataset_fd().has_value(),
                  "Disk-based datasets are not supported for multi-partition search");
-    RAFT_EXPECTS(indices[i]->size() == 0 || indices[i]->graph().extent(0) > 0,
-                 "Partition %u has no graph: multi-partition search walks the graphs, and an "
-                 "index without one is searched only by single-index search with the FP8 "
-                 "filtered scan",
-                 i);
     RAFT_EXPECTS(indices[i]->metric() == metric,
                  "All partitions must use the same distance metric for multi-partition search");
     RAFT_EXPECTS(indices[i]->graph().extent(1) == graph_degree,

@@ -33,19 +33,6 @@ void composite_index<T, IdxT, OutputIdxT>::search(
       handle, params, *children_.front(), queries, neighbors, distances, filter);
     return;
   }
-  // The FP8 filtered scan searches one index: several children always walk their graphs. One
-  // retry flag per query cannot stand for children searched side by side, and a row list holds
-  // the row numbers of one index.
-  RAFT_EXPECTS(params.filtered_route != cuvs::neighbors::cagra::filtered_route_mode::SCAN,
-               "search_params::filtered_route SCAN is not supported by a composite index of "
-               "several children");
-  RAFT_EXPECTS(params.scan_retry == nullptr,
-               "search_params::scan_retry is not supported by a composite index of several "
-               "children");
-  RAFT_EXPECTS(filter.get_filter_type() != cuvs::neighbors::filtering::FilterType::RowList,
-               "row_list_filter is not supported by a composite index of several children");
-  auto graph_params           = params;
-  graph_params.filtered_route = cuvs::neighbors::cagra::filtered_route_mode::GRAPH;
 
   size_t num_queries = queries.extent(0);
   size_t K           = neighbors.extent(1);
@@ -85,7 +72,7 @@ void composite_index<T, IdxT, OutputIdxT>::search(
         temp_distances[i].data(), num_queries, K);
 
     cuvs::neighbors::cagra::search(stream_pool_handle,
-                                   graph_params,
+                                   params,
                                    *children_[i],
                                    queries,
                                    temp_neighbors_view,

@@ -197,32 +197,4 @@ TEST_P(AnnHNSW_U8, AnnHNSW) { this->testHNSW(); }
 
 INSTANTIATE_TEST_CASE_P(AnnHNSWTest, AnnHNSW_U8, ::testing::ValuesIn(inputs));
 
-// A CAGRA index of rows and no graph (which only the FP8 filtered scan of CAGRA search can search)
-// has no graph to convert: every hierarchy refuses it, saying so.
-TEST(AnnHNSWFromCagra, RejectsAnIndexWithoutAGraph)
-{
-  raft::resources res;
-  constexpr int64_t n_rows = 64, dim = 16;
-  auto rows = raft::make_device_matrix<float, int64_t>(res, n_rows, dim);
-  raft::random::RngState r(1234ULL);
-  raft::random::uniform(res, r, rows.data_handle(), n_rows * dim, 0.1f, 2.0f);
-  cuvs::neighbors::test::padded_device_matrix_for_cagra<float> padded(
-    res, raft::make_const_mdspan(rows.view()));
-  cuvs::neighbors::cagra::device_padded_index<float, uint32_t> cagra_index(
-    res, cuvs::distance::DistanceType::L2Expanded);
-  cagra_index = cuvs::neighbors::cagra::update_dataset(res, std::move(cagra_index), padded.view);
-  ASSERT_EQ(cagra_index.graph().extent(0), 0);
-
-  for (auto hierarchy : {HnswHierarchy::NONE, HnswHierarchy::CPU, HnswHierarchy::GPU}) {
-    index_params params;
-    params.hierarchy = hierarchy;
-    try {
-      (void)from_cagra(res, params, cagra_index);
-      ADD_FAILURE() << "converted an index without a graph";
-    } catch (const raft::logic_error& e) {
-      EXPECT_NE(std::string(e.what()).find("no graph"), std::string::npos) << e.what();
-    }
-  }
-}
-
 }  // namespace cuvs::neighbors::hnsw

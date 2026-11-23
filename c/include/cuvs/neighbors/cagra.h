@@ -470,54 +470,6 @@ enum cuvsCagraFilterExpansion {
 };
 
 /**
- * @brief Defined, as 2, when this header has the FP8 filtered scan: enum cuvsCagraFilteredRoute
- * (CUVS_CAGRA_FILTERED_ROUTE_GRAPH = 0, CUVS_CAGRA_FILTERED_ROUTE_SCAN = 1,
- * CUVS_CAGRA_FILTERED_ROUTE_AUTO = 100); the cuvsCagraSearchParams fields `filtered_route`,
- * `scan_max_pass_rate`, `scan_candidates`, `scan_skip_last_block`, `scan_retry` and
- * `scan_full_selection`; cuvsCagraUpdateScanCodes; the ROW_LIST filter type in cuvsCagraSearch;
- * and cuvsCagraIndexFromArgs with a NULL graph.
- */
-#define CUVS_CAGRA_HAS_FILTERED_SCAN 2
-
-/**
- * @brief How a search finds its candidates: by walking the graph, or by the FP8 filtered scan
- *
- * The scan scores every row the filter passes from FP8 codes of the index's rows
- * (cuvsCagraUpdateScanCodes), for all the queries of the call at once, keeps `scan_candidates` of
- * them per query, and re-scores those from the index's FP16 rows: one pass over the passing rows
- * shared by the call, for filters that pass few rows. It can run a search when the index holds
- * FP16 rows densely on the device and has scan codes for every row; the metric is L2Expanded or
- * L2Unexpanded, the dimension at most 512 and k from 1 to 4096; the index has no source indices
- * and the search no `query_bitsets`; the filter is a BITSET over at least the index's rows, a
- * ROW_LIST, or NO_FILTER (every row); and this build of cuVS holds scan kernels for the device (a
- * kernel image for sm_89 or newer).
- *
- * Neighbors are row numbers of the index, distances squared L2, and slots past the rows that pass
- * hold 0xFFFFFFFF (4294967295 in an int64 output) and the largest float distance; the graph search
- * marks them with ids at or above the index size too, not always the same value, so treat any id
- * at or above the index size as empty. Candidates
- * tied in FP8 distance at the scan's cut can change between identical calls, and with them the
- * last results of a query. cuvsCagraSearchMultiPartition, tiered-index search and multi-GPU
- * search never scan: they walk the graph, and refuse CUVS_CAGRA_FILTERED_ROUTE_SCAN, `scan_retry`
- * and a ROW_LIST filter.
- */
-enum cuvsCagraFilteredRoute {
-  /** Walk the graph. A zeroed cuvsCagraSearchParams takes it. */
-  CUVS_CAGRA_FILTERED_ROUTE_GRAPH = 0,
-  /** Scan whenever the scan can run the search, and fail when it cannot. */
-  CUVS_CAGRA_FILTERED_ROUTE_SCAN = 1,
-  /**
-   * Scan when the scan can run the search, a filter is given and at most `scan_max_pass_rate` of
-   * the rows pass it; walk the graph otherwise, and also when the scan runs out of memory. An
-   * index without scan codes always walks the graph. An index without a graph
-   * (cuvsCagraIndexFromArgs with a NULL graph) is searched by the scan only: there AUTO scans
-   * whenever the scan can run, filtered or not, and fails otherwise. The default of
-   * cuvsCagraSearchParamsCreate.
-   */
-  CUVS_CAGRA_FILTERED_ROUTE_AUTO = 100
-};
-
-/**
  * @brief Supplemental parameters to search CAGRA index
  *
  */
@@ -614,48 +566,6 @@ struct cuvsCagraSearchParams {
    * search's work on the stream has finished.
    */
   uintptr_t query_bitsets;
-
-  /** Whether the search walks the graph or runs the FP8 filtered scan. */
-  enum cuvsCagraFilteredRoute filtered_route;
-
-  /**
-   * CUVS_CAGRA_FILTERED_ROUTE_AUTO scans when at most this share of the index's rows pass the
-   * filter. Note the inversion: this is a share of passing rows, while `filtering_rate` is the
-   * share filtered out. The share is the length of a ROW_LIST over the index's rows, else
-   * 1 - `filtering_rate` when that is given, else the count of the BITSET's set bits (counted on
-   * the device). 0 or less takes 0.25.
-   */
-  float scan_max_pass_rate;
-
-  /**
-   * Candidates per query the scan re-scores from the FP16 rows: at least k, at most 4096 and the
-   * rows that pass. 0 takes k + max(16, 3 k).
-   */
-  uint32_t scan_candidates;
-
-  /**
-   * The caller's claim that the last 16-dimension block of the scan codes and of the queries holds
-   * one coordinate, with the same value in every row and every query (for example unit vectors
-   * augmented for cosine as L2, with a dimension one more than a multiple of 16). The scan then
-   * leaves that block out of its FP8 distances, which keeps their order, and the re-scoring from
-   * the FP16 rows restores the exact distance. A wrong claim changes which candidates the scan
-   * keeps. The graph walk ignores it.
-   */
-  bool scan_skip_last_block;
-
-  /**
-   * When not 0, the device address of one uint32 flag per query, and the scan does not wait on the
-   * GPU to check its sampled cutoff: it writes 1 for each query whose cutoff kept too few or too
-   * many rows (whose results are then not exact: search it again with `scan_full_selection`) and 0
-   * for the others. When 0, the scan waits for that check itself and selects again where it fails.
-   * The array must stay valid until the search's work on the stream has finished. A search that
-   * walks the graph sets every flag to 0. cuvsCagraSearchMultiPartition, tiered-index search and
-   * multi-GPU search refuse it.
-   */
-  uintptr_t scan_retry;
-
-  /** Score every row the scan reads and select from all of them, without the sampled cutoff. */
-  bool scan_full_selection;
 };
 
 typedef struct cuvsCagraSearchParams* cuvsCagraSearchParams_t;
@@ -799,37 +709,6 @@ CUVS_EXPORT cuvsError_t cuvsCagraIndexGetGraph(cuvsCagraIndex_t index, DLManaged
 CUVS_EXPORT cuvsError_t cuvsCagraUpdateDataset(cuvsResources_t res,
                                                cuvsDataset_t dataset,
                                                cuvsCagraIndex_t index);
-
-/**
- * @brief Attach FP8 codes of the index's rows for the filtered scan (enum cuvsCagraFilteredRoute),
- * or detach them when \p codes is NULL.
- *
- * The codes are in the layout cuvsFp8QuantizerTransform writes: one row of E4M3 bytes per row of
- * the index, whose width is a multiple of 16 and at least the dimension rounded up to 16
- * (cuvsFp8QuantizerEncodedRowLength), and one float32 scale per row; a value decodes as its E4M3
- * value times the row's scale. The index keeps a view, not a copy: the caller keeps both tensors
- * alive and unchanged while the index is searched. The codes are not serialized, and a new
- * dataset drops them: cuvsCagraExtend, cuvsCagraUpdateDataset and deserializing give an index
- * without codes. FP16 indexes with a device padded dataset only.
- *
- * @code {.c}
- * // codes: [n_rows, encoded_row_length] uint8 and row_scales: [n_rows] float32, on the device.
- * cuvsFp8QuantizerTransform(res, dataset, codes, row_scales);
- * cuvsCagraUpdateScanCodes(res, codes, row_scales, index);
- * @endcode
- *
- * @param[in] res        cuvsResources_t opaque C handle
- * @param[in] codes      DLManagedTensor* of a 2-D uint8 row-major device tensor [n_rows, width]
- *                       with a 16-byte aligned base, or NULL to detach the codes
- * @param[in] row_scales DLManagedTensor* of a 1-D float32 device tensor [n_rows]; ignored when
- *                       \p codes is NULL
- * @param[inout] index   CAGRA index of FP16 rows in a device padded dataset
- * @return cuvsError_t
- */
-CUVS_EXPORT cuvsError_t cuvsCagraUpdateScanCodes(cuvsResources_t res,
-                                                 DLManagedTensor* codes,
-                                                 DLManagedTensor* row_scales,
-                                                 cuvsCagraIndex_t index);
 
 /**
  * @}
@@ -995,8 +874,7 @@ CUVS_EXPORT cuvsError_t cuvsCagraExtend(cuvsResources_t res,
  * @param[out] neighbors DLManagedTensor* output `k` neighbors for queries
  * @param[out] distances DLManagedTensor* output `k` distances for queries
  * @param[in] filter cuvsFilter input filter that can be used
-              to filter queries and neighbors based on the given bitset, or with ROW_LIST the
-              device uint32 array of the rows that pass (see enum cuvsCagraFilteredRoute).
+              to filter queries and neighbors based on the given bitset.
  */
 CUVS_EXPORT cuvsError_t cuvsCagraSearch(cuvsResources_t res,
                             cuvsCagraSearchParams_t params,
@@ -1163,15 +1041,9 @@ CUVS_EXPORT cuvsError_t cuvsCagraDeserializeGraphAndDataset(cuvsResources_t res,
 /**
  * Load index from a dataset and graph
  *
- * With a NULL \p graph, the index holds the dataset and no graph. Only the FP8 filtered scan can
- * search such an index (see enum cuvsCagraFilteredRoute): give it a device dataset whose row
- * width CAGRA takes as padded, attach scan codes with cuvsCagraUpdateScanCodes, and search it
- * with CUVS_CAGRA_FILTERED_ROUTE_AUTO or CUVS_CAGRA_FILTERED_ROUTE_SCAN. Walking the graph fails.
- *
  * @param[in] res cuvsResources_t opaque C handle
  * @param[in] metric cuvsDistanceType to use in the index
- * @param[in] graph the knn graph to use, shape (size, graph_degree), or NULL for an index without
- *                  a graph
+ * @param[in] graph the knn graph to use, shape (size, graph_degree)
  * @param[in] dataset the dataset to use, shape (size, dim)
  * @param[inout] index cuvsCagraIndex_t CAGRA index populated with the graph and dataset.
  *                                      This index needs to be already created with

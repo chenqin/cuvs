@@ -2274,12 +2274,6 @@ std::unique_ptr<index<T>> from_cagra(
   std::optional<raft::host_matrix_view<const T, int64_t, raft::row_major>> dataset)
 {
   validate_output_format(params);
-  // An index with rows and no graph (a dataset and an empty graph, which only the FP8 filtered
-  // scan of CAGRA search can search) has no graph to convert.
-  RAFT_EXPECTS(cagra_index.size() == 0 || cagra_index.graph().extent(0) > 0 ||
-                 cagra_index.graph_fd().has_value() || cagra_index.dataset_fd().has_value(),
-               "hnsw::from_cagra: the index has no graph to convert, only rows for the CAGRA FP8 "
-               "filtered scan");
 
   if constexpr (is_host_cagra_hnsw_export_index_v<T, CagraIndexT>) {
     if (!cagra_index.dataset_fd().has_value() && !dataset.has_value()) {

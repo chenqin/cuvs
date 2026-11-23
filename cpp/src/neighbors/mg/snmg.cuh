@@ -28,8 +28,6 @@
 #include <cuvs/util/numpy_dtype.hpp>
 
 #include <fstream>
-#include <optional>
-#include <type_traits>
 
 namespace cuvs::neighbors {
 using namespace raft;
@@ -616,23 +614,6 @@ void search(const raft::resources& clique,
   // Making sure that the NCCL comms are instantiated at this stage.
   // This prevents it being done inside of an OpenMP thread.
   raft::resource::get_nccl_comms(clique);
-
-  // Ranks and batches each search a part of the queries with the same parameters, so the CAGRA
-  // FP8 filtered scan (a single-index route with one retry flag per query) does not apply: they
-  // walk the graph. Checked here, before any OpenMP region, so that a refusal reaches the caller.
-  [[maybe_unused]] std::optional<cuvs::neighbors::mg_search_params<cagra::search_params>>
-    cagra_graph_params;
-  if constexpr (std::is_same<AnnIndexType, cagra::device_padded_index<T, IdxT>>::value ||
-                std::is_same<AnnIndexType, cagra::device_standard_index<T, IdxT>>::value) {
-    cagra_graph_params.emplace(
-      *static_cast<const cuvs::neighbors::mg_search_params<cagra::search_params>*>(search_params));
-    RAFT_EXPECTS(cagra_graph_params->filtered_route != cagra::filtered_route_mode::SCAN,
-                 "search_params::filtered_route SCAN is not supported by multi-GPU search");
-    RAFT_EXPECTS(cagra_graph_params->scan_retry == nullptr,
-                 "search_params::scan_retry is not supported by multi-GPU search");
-    cagra_graph_params->filtered_route = cagra::filtered_route_mode::GRAPH;
-    search_params                      = &*cagra_graph_params;
-  }
 
   int64_t n_rows      = queries.extent(0);
   int64_t n_cols      = queries.extent(1);

@@ -26,7 +26,6 @@
 #include <limits>
 #include <memory>
 #include <tuple>
-#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -870,39 +869,22 @@ inline auto validate_sample_filter(cuvs::neighbors::filtering::base_filter const
     sample_filter == nullptr ||
       sample_filter->get_filter_type() != cuvs::neighbors::filtering::FilterType::Roaring,
     "dynamic_batching does not support roaring_bitmap_filter; use direct cagra::search instead.");
-  RAFT_EXPECTS(
-    sample_filter == nullptr ||
-      sample_filter->get_filter_type() != cuvs::neighbors::filtering::FilterType::RowList,
-    "dynamic_batching does not support row_list_filter; use direct cagra::search instead.");
   return sample_filter;
 }
 
 /**
  * Batching re-lays the query rows, so upstream parameters that hold one entry per query are
- * refused for the same reason as a roaring_bitmap_filter. The CAGRA FP8 filtered scan is a
- * single-index route: batched searches walk the graph, so its parameters are refused, and the
- * returned copy (which the batch runner keeps) sets filtered_route to GRAPH.
+ * refused for the same reason as a roaring_bitmap_filter.
  */
 template <typename SearchParamsT>
-inline auto validate_upstream_params(const SearchParamsT& upstream_params) -> SearchParamsT
+inline auto validate_upstream_params(const SearchParamsT& upstream_params) -> const SearchParamsT&
 {
-  auto params = upstream_params;
-  if constexpr (requires { params.query_bitsets; }) {
-    RAFT_EXPECTS(params.query_bitsets == nullptr,
+  if constexpr (requires { upstream_params.query_bitsets; }) {
+    RAFT_EXPECTS(upstream_params.query_bitsets == nullptr,
                  "dynamic_batching does not support search_params::query_bitsets; use direct "
                  "cagra::search instead.");
   }
-  if constexpr (requires { params.filtered_route; }) {
-    using route_mode = std::remove_cvref_t<decltype(params.filtered_route)>;
-    RAFT_EXPECTS(params.filtered_route != route_mode::SCAN,
-                 "dynamic_batching does not support search_params::filtered_route SCAN; use "
-                 "direct cagra::search instead.");
-    RAFT_EXPECTS(params.scan_retry == nullptr,
-                 "dynamic_batching does not support search_params::scan_retry; use direct "
-                 "cagra::search instead.");
-    params.filtered_route = route_mode::GRAPH;
-  }
-  return params;
+  return upstream_params;
 }
 
 template <typename T, typename IdxT>
