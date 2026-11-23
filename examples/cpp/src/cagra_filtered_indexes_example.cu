@@ -3,26 +3,35 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// Builds, saves, loads and searches a CAGRA index for heavily filtered searches: a graph index of
-// FP16 rows, searched with the two-hop walk (filter_expansion PASSING_TWO_HOP), which keeps the
-// walk connected when most rows fail the filter. See "Building indexes for filtered search" in the
-// CAGRA guide.
+// Builds, saves, loads and searches the two CAGRA indexes that serve heavily filtered searches:
+//
+//  - a graph index of FP16 rows, searched with the two-hop walk (filter_expansion PASSING_TWO_HOP),
+//    which suits filters that pass a few percent of the rows or more;
+//  - a graph-free index of the same FP16 rows with FP8 codes attached, searched by the filtered
+//  scan
+//    (filtered_route SCAN), which suits narrow filters and is near exact.
+//
+// A graph index can hold the codes as well and let filtered_route AUTO choose per search. The codes
+// are not serialized with the index, so this example writes them to their own file and attaches
+// them again after loading. See "Building indexes for filtered search" in the CAGRA guide.
 //
 // Usage:
-//   CAGRA_FILTERED_INDEXES_EXAMPLE                       synthetic rows: build, save, load, search
-//   CAGRA_FILTERED_INDEXES_EXAMPLE build DATA.fbin OUT   build the index from float32 rows
-//   CAGRA_FILTERED_INDEXES_EXAMPLE search OUT            load it and search at 1% and 10% filters
+//   CAGRA_FILTERED_INDEXES_EXAMPLE                         synthetic rows, build, save, load,
+//   search CAGRA_FILTERED_INDEXES_EXAMPLE build DATA.fbin OUT     build both indexes from float32
+//   rows CAGRA_FILTERED_INDEXES_EXAMPLE search OUT              load them and search at 1% and 10%
+//   filters
 //
 // DATA.fbin is the benchmark format: uint32 rows, uint32 dimension, then float32 rows. OUT receives
-// graph.cagra (FP16 rows and graph).
+// graph.cagra (FP16 rows and graph), rows.f16 (the FP16 rows alone, for the graph-free index) and
+// codes.fp8 (FP8 codes and row scales).
 
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>
+#include <cuvs/preprocessing/quantize/fp8.hpp>
 
 #include <raft/core/copy.cuh>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
-#include <raft/core/error.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/random/rng.cuh>
@@ -45,6 +54,7 @@
 namespace {
 
 namespace cagra = cuvs::neighbors::cagra;
+namespace fp8   = cuvs::preprocessing::quantize::fp8;
 
 constexpr int64_t n_queries = 100;
 constexpr int64_t top_k     = 100;
@@ -119,7 +129,90 @@ auto make_padded_rows(raft::device_resources const& res,
   return {std::move(owner), view};
 }
 
-/** Build the graph index and write it, with its rows, to graph.cagra. */
+template <typename T>
+void write_array(std::ofstream& out, T const* data, size_t n)
+{
+  out.write(reinterpret_cast<char const*>(data), n * sizeof(T));
+}
+
+template <typename T>
+void read_array(std::ifstream& in, T* data, size_t n)
+{
+  in.read(reinterpret_cast<char*>(data), n * sizeof(T));
+}
+
+/** rows.f16: int64 rows, int64 dimension, then the FP16 rows, densely. */
+void save_rows(std::string const& path, host_rows const& rows)
+{
+  std::ofstream out(path, std::ios::binary);
+  int64_t header[2] = {rows.n_rows, rows.dim};
+  write_array(out, header, 2);
+  write_array(out, rows.data.data(), rows.data.size());
+}
+
+auto load_rows(std::string const& path) -> host_rows
+{
+  std::ifstream in(path, std::ios::binary);
+  if (!in) { throw std::runtime_error("cannot open " + path); }
+  int64_t header[2];
+  read_array(in, header, 2);
+  host_rows rows{
+    header[0], header[1], std::vector<half>(static_cast<size_t>(header[0]) * header[1])};
+  read_array(in, rows.data.data(), rows.data.size());
+  return rows;
+}
+
+/** codes.fp8: int64 rows, int64 code row width, then the codes, then one float scale a row. */
+void save_codes(raft::device_resources const& res, std::string const& path, fp8::quantizer const& q)
+{
+  auto view  = q.view();
+  auto rows  = view.codes.extent(0);
+  auto width = view.codes.extent(1);
+  std::vector<uint8_t> codes(static_cast<size_t>(rows) * width);
+  std::vector<float> scales(rows);
+  auto stream = raft::resource::get_cuda_stream(res);
+  raft::copy(codes.data(), view.codes.data_handle(), codes.size(), stream);
+  raft::copy(scales.data(), view.row_scales.data_handle(), scales.size(), stream);
+  raft::resource::sync_stream(res);
+  std::ofstream out(path, std::ios::binary);
+  int64_t header[2] = {rows, width};
+  write_array(out, header, 2);
+  write_array(out, codes.data(), codes.size());
+  write_array(out, scales.data(), scales.size());
+}
+
+/** Device copies of codes.fp8, for index::update_scan_codes. */
+struct device_codes {
+  raft::device_matrix<uint8_t, int64_t> codes;
+  raft::device_vector<float, int64_t> row_scales;
+
+  auto view() const -> fp8::quantizer_view
+  {
+    return fp8::quantizer_view{raft::make_const_mdspan(codes.view()),
+                               raft::make_const_mdspan(row_scales.view())};
+  }
+};
+
+auto load_codes(raft::device_resources const& res, std::string const& path) -> device_codes
+{
+  std::ifstream in(path, std::ios::binary);
+  if (!in) { throw std::runtime_error("cannot open " + path); }
+  int64_t header[2];
+  read_array(in, header, 2);
+  std::vector<uint8_t> codes(static_cast<size_t>(header[0]) * header[1]);
+  std::vector<float> scales(header[0]);
+  read_array(in, codes.data(), codes.size());
+  read_array(in, scales.data(), scales.size());
+  device_codes out{raft::make_device_matrix<uint8_t, int64_t>(res, header[0], header[1]),
+                   raft::make_device_vector<float, int64_t>(res, header[0])};
+  auto stream = raft::resource::get_cuda_stream(res);
+  raft::copy(out.codes.data_handle(), codes.data(), codes.size(), stream);
+  raft::copy(out.row_scales.data_handle(), scales.data(), scales.size(), stream);
+  raft::resource::sync_stream(res);
+  return out;
+}
+
+/** Build the graph index and the FP8 codes, and write the three files. */
 void build(raft::device_resources const& res, host_rows const& rows, std::string const& out_dir)
 {
   auto started = std::chrono::steady_clock::now();
@@ -134,6 +227,12 @@ void build(raft::device_resources const& res, host_rows const& rows, std::string
   auto padded                      = make_padded_rows(res, raft::make_const_mdspan(dataset.view()));
   auto index                       = cagra::build(res, params, padded.view);
   cagra::serialize(res, out_dir + "/graph.cagra", index, /*include_dataset=*/true);
+
+  // The codes: one E4M3 code per component and one scale per row, from the same FP16 rows.
+  fp8::quantizer codes(res, rows.n_rows, static_cast<uint32_t>(rows.dim));
+  fp8::transform(res, raft::make_const_mdspan(dataset.view()), codes);
+  save_codes(res, out_dir + "/codes.fp8", codes);
+  save_rows(out_dir + "/rows.f16", rows);
 
   std::chrono::duration<double> took = std::chrono::steady_clock::now() - started;
   std::cout << "built " << rows.n_rows << " rows of " << rows.dim << " dimensions into " << out_dir
@@ -184,35 +283,29 @@ double recall(std::vector<uint32_t> const& found, std::vector<int64_t> const& tr
   return total ? static_cast<double>(hits) / total : 1.0;
 }
 
-/** Load the index from out_dir and search it with a 1% and a 10% filter. */
+/** Load both indexes from out_dir and search them with a 1% and a 10% filter. */
 void search(raft::device_resources const& res, std::string const& out_dir)
 {
-  // The graph index and its FP16 rows, from the same file.
+  // The graph index, its FP16 rows from the same file, and its codes (for AUTO).
   cagra::index<half, uint32_t> graph(res);
   std::unique_ptr<cuvs::neighbors::device_padded_dataset<half, int64_t>> graph_rows;
   cagra::deserialize(res, out_dir + "/graph.cagra", &graph, &graph_rows);
-  auto const n_rows = static_cast<int64_t>(graph.size());
-  auto const dim    = static_cast<int64_t>(graph.dim());
+  auto codes = load_codes(res, out_dir + "/codes.fp8");
+  graph.update_scan_codes(res, codes.view());
 
-  // The rows, dense, for the queries and the exact answers.
-  auto padded   = graph.dataset().data_const_view();
-  auto rows_dev = raft::make_device_matrix<half, int64_t>(res, n_rows, dim);
-  RAFT_CUDA_TRY(cudaMemcpy2DAsync(rows_dev.data_handle(),
-                                  dim * sizeof(half),
-                                  padded.data_handle(),
-                                  padded.stride(0) * sizeof(half),
-                                  dim * sizeof(half),
-                                  n_rows,
-                                  cudaMemcpyDeviceToDevice,
-                                  raft::resource::get_cuda_stream(res)));
+  // The graph-free index: the FP16 rows and the codes, no graph. It can be searched by the scan
+  // only, so it holds half the device memory of a graph index whose graph is as large as its rows.
+  auto rows      = load_rows(out_dir + "/rows.f16");
+  auto rows_dev  = to_device(res, rows);
+  auto scan_rows = make_padded_rows(res, raft::make_const_mdspan(rows_dev.view()));
+  cagra::index<half, uint32_t> scan_only(res, cuvs::distance::DistanceType::L2Expanded);
+  scan_only = cagra::update_dataset(res, std::move(scan_only), scan_rows.view);
+  scan_only.update_scan_codes(res, codes.view());
 
-  // Queries: the first rows, so that every query has neighbours at every filter width. Their row
-  // stride is the dimension, which keeps the search to one launch for all of them.
-  auto queries = raft::make_device_matrix<half, int64_t>(res, n_queries, dim);
-  raft::copy(queries.data_handle(),
-             rows_dev.data_handle(),
-             queries.size(),
-             raft::resource::get_cuda_stream(res));
+  // Queries: the first rows, so that every query has neighbours at every filter width.
+  auto queries = raft::make_device_matrix<half, int64_t>(res, n_queries, rows.dim);
+  raft::copy(
+    queries.data_handle(), rows.data.data(), queries.size(), raft::resource::get_cuda_stream(res));
 
   // Exact answers: brute force over the same FP16 rows.
   auto exact_index = cuvs::neighbors::brute_force::build(
@@ -222,16 +315,22 @@ void search(raft::device_resources const& res, std::string const& out_dir)
   cagra::search_params two_hop;
   two_hop.algo                 = cagra::search_algo::MULTI_CTA;
   two_hop.filter_expansion     = cagra::filter_expansion_mode::PASSING_TWO_HOP;
+  two_hop.filtered_route       = cagra::filtered_route_mode::GRAPH;
   two_hop.itopk_size           = 512;
   two_hop.search_width         = 4;
   two_hop.max_iterations       = 18;
   two_hop.num_random_samplings = 2;
   two_hop.thread_block_size    = 64;
 
+  // The scan: re-score twice k candidates from the FP16 rows.
+  cagra::search_params scan;
+  scan.filtered_route  = cagra::filtered_route_mode::SCAN;
+  scan.scan_candidates = 2 * top_k;
+
   for (double pass_rate : {0.01, 0.10}) {
-    auto [words, passing] = make_filter(res, n_rows, pass_rate);
+    auto [words, passing] = make_filter(res, rows.n_rows, pass_rate);
     cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t> filter(
-      cuvs::core::bitset_view<uint32_t, int64_t>(words.data_handle(), n_rows));
+      cuvs::core::bitset_view<uint32_t, int64_t>(words.data_handle(), rows.n_rows));
 
     auto truth_rows = raft::make_device_matrix<int64_t, int64_t>(res, n_queries, top_k);
     auto truth_dist = raft::make_device_matrix<float, int64_t>(res, n_queries, top_k);
@@ -261,9 +360,11 @@ void search(raft::device_resources const& res, std::string const& out_dir)
       std::cout << "  " << name << ": recall " << recall(to_host(res, found), truth) << ", "
                 << took.count() << " ms for " << n_queries << " queries" << std::endl;
     };
-    std::cout << "filter passing " << passing << " of " << n_rows << " rows (" << 100 * pass_rate
-              << "%), k " << top_k << std::endl;
-    run("two-hop walk", graph, two_hop);
+    std::cout << "filter passing " << passing << " of " << rows.n_rows << " rows ("
+              << 100 * pass_rate << "%), k " << top_k << std::endl;
+    run("two-hop walk, graph index", graph, two_hop);
+    run("FP8 scan, graph index (AUTO would choose it below scan_max_pass_rate)", graph, scan);
+    run("FP8 scan, graph-free index", scan_only, scan);
   }
 }
 
