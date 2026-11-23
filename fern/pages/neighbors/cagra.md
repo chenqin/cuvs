@@ -1197,25 +1197,16 @@ cagra::search(res, search_params, index, queries, neighbors, distances,
 
 ### Building indexes for filtered search
 
-The two filtered routes read different indexes. The two-hop walk (`PASSING_TWO_HOP`) needs the graph; the filtered scan needs FP16 rows and their FP8 codes, and no graph. Which to build depends on the filters the searches carry:
-
-| Filters | Index | Search |
-| --- | --- | --- |
-| Mostly narrow (a fraction of a percent of the rows to a few percent) | FP16 rows and FP8 codes, no graph | `filtered_route = SCAN`: near-exact results; the cost of a call follows the rows its filter passes |
-| Mostly wide (a few percent of the rows or more), or unfiltered searches mixed in | FP16 rows and a graph | `filter_expansion = PASSING_TWO_HOP`: the cost of a search does not depend on the filter; recall is set by `itopk_size`, `search_width`, `max_iterations` and `num_random_samplings` |
-| Both | FP16 rows, a graph and FP8 codes | `filtered_route = AUTO` scans below `scan_max_pass_rate` and walks above it |
-
-The scan's cost per call is one pass over the rows its filter passes, shared by the queries of the call, so it wins while filters stay narrow and loses as they widen: a filter passing 5% of 46.5 million rows makes every call scan 2.3 million rows. The walk's cost is that of an unfiltered search, at the recall its parameters buy. Measure both on a sample of the real filters before choosing, and keep the graph whenever wide filters or unfiltered searches occur.
+For searches whose filters pass a small part of the rows, and whose passing rows are close to each other in the graph, build an FP16 index with a graph and search it with `filter_expansion = PASSING_TWO_HOP`. See [Filter expansion](#filter-expansion) for the filters this mode suits and the ones it does not. Recall is tuned with `itopk_size`, `search_width`, `max_iterations` and `num_random_samplings`.
 
 Building:
 
-- Build from FP16 rows. The scan reads FP16 rows to re-score its candidates, and `update_scan_codes` refuses other indexes. FP16 also halves the memory traffic of the walk.
-- `graph_degree = 32` and `intermediate_graph_degree = 64` are a good start for the two-hop walk: they leave about 1,000 rows within two hops of each row, so a filter passing one row in 1,000 still has passing rows to walk to. A filter narrower than about one row in `graph_degree * graph_degree` leaves the walk stuck at its starting rows; give those filters the scan.
-- Encode the codes from the same FP16 rows with `fp8::transform`.
-- Save the codes yourself. `serialize` writes the rows and the graph and not the codes, and a deserialized index has none, so write the codes and row scales to a file of their own and attach them again with `update_scan_codes` after loading. An index without a graph cannot be serialized: keep its FP16 rows in a file of their own and give them to a new index with `update_dataset`.
-- Memory per row on the device: the FP16 rows take 2 bytes a padded dimension; the graph takes 4 bytes a neighbor (128 bytes at degree 32); the codes take `fp8::get_encoded_row_length(dim)` bytes plus a 4-byte scale. An index without a graph saves the graph's share, which at 65 dimensions is about as large as the rows.
+- Build from FP16 rows: the distance computations read half the memory that FP32 rows need.
+- `graph_degree = 32` and `intermediate_graph_degree = 64` are a good start for `PASSING_TWO_HOP`: about 1,000 rows are then within two hops of each row. A filter that passes fewer than about one row in `graph_degree * graph_degree` leaves the search at its initial random seed nodes.
+- Memory per row on the device: the FP16 rows take 2 bytes a padded dimension; the graph takes 4 bytes a neighbor (128 bytes at degree 32).
+- Search with queries whose row stride equals the dimension (a pitch view of padded rows works). With any other stride the search runs one launch per query.
 
-The example `examples/cpp/src/cagra_filtered_indexes_example.cu` builds, saves, loads and searches both indexes, with these settings and exact answers from brute force to measure recall against:
+The example `examples/cpp/src/cagra_filtered_indexes_example.cu` builds, saves, loads and searches such an index, with exact answers from brute force to measure recall against:
 
 ```bash
 # synthetic rows: build, save, load and search in the current directory
@@ -1227,24 +1218,6 @@ The example `examples/cpp/src/cagra_filtered_indexes_example.cu` builds, saves, 
 ```
 
 `examples/cpp/scripts/build_filtered_indexes.sh DATA_DIR OUT_DIR` builds one index per `.fbin` file of a directory, one per GPU at a time, and then searches each. A build of 46.5 million 65-dimension rows takes about two minutes on a B200.
-
-Loading for search, in C++:
-
-```cpp
-// The graph index: rows and graph from the file; then its codes, for SCAN or AUTO.
-cagra::index<half, uint32_t> graph(res);
-std::unique_ptr<cuvs::neighbors::device_padded_dataset<half, int64_t>> graph_rows;
-cagra::deserialize(res, "out/graph.cagra", &graph, &graph_rows);
-graph.update_scan_codes(res, codes);  // codes: an fp8::quantizer_view of the loaded codes.fp8
-
-// The index without a graph: the FP16 rows (from rows.f16, on the device) and the codes only.
-// Rows whose width CAGRA already takes are used in place (make_device_padded_dataset_view);
-// others get a padded copy (make_device_padded_dataset), which must outlive the index.
-auto rows = cuvs::neighbors::make_device_padded_dataset(res, fp16_rows);
-cagra::index<half, uint32_t> scan_only(res, cuvs::distance::DistanceType::L2Expanded);
-scan_only = cagra::update_dataset(res, std::move(scan_only), rows->view());
-scan_only.update_scan_codes(res, codes);
-```
 
 ### C++ filter UDFs
 
