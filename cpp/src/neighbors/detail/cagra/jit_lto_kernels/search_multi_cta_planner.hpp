@@ -21,15 +21,19 @@ template <typename DataTag,
 struct CagraMultiCtaSearchPlanner
   : CagraPlannerBase<DataTag, IndexTag, DistanceTag, QueryTag, CodebookTag, SampleFilterJitTag> {
   static inline rtcx::launcher_jit_cache launcher_jit_cache{};
+  static inline rtcx::launcher_jit_cache launcher_jit_cache_small{};
 
+  // small: the variant compiled for blocks of at most 256 threads (search_multi_cta_small).
   CagraMultiCtaSearchPlanner(cuvs::distance::DistanceType /*metric*/,
                              uint32_t /*team_size*/,
                              uint32_t /*dataset_block_dim*/,
                              bool /*is_vpq*/,
                              uint32_t /*pq_bits*/,
-                             uint32_t /*pq_len*/)
+                             uint32_t /*pq_len*/,
+                             bool small = false)
     : CagraPlannerBase<DataTag, IndexTag, DistanceTag, QueryTag, CodebookTag, SampleFilterJitTag>(
-        "search_multi_cta", launcher_jit_cache)
+        small ? "search_multi_cta_small" : "search_multi_cta",
+        small ? launcher_jit_cache_small : launcher_jit_cache)
   {
   }
 
