@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace cuvs::core::postings {
@@ -30,34 +31,51 @@ constexpr int kOpAll         = 3;
 constexpr int kOpNone        = 4;
 constexpr int kOpAndNot      = 5;  // a & ~b
 
+/** Rows of a run one block of scatter_chunks takes. */
+constexpr uint32_t kChunk = 1024;
+
 /**
- * Set the bit of every row of consecutive runs that lies in [first_row, first_row + n_rows):
- * output position i is row `starts[r][i - (prefix[r] - prefix[0])]` of the run r whose prefix
- * (the rows of its leaf's runs before it) less the first run's is the largest at most i. Any
- * range of a leaf's runs, such as one run, can be scattered this way.
+ * Set the bit of every row of consecutive runs that lies in [first_row, first_row + n_rows). Each
+ * block takes kChunk rows of one run: chunks[r] - chunks[0] is the first block of run r (the runs'
+ * blocks are numbered consecutively, as their leaf's), so a block finds its run with one binary
+ * search, and its threads then read the run's rows in order (coalesced) with 32-bit offsets.
  */
-__global__ void scatter_runs(const uint32_t* const* starts,
-                             const int64_t* prefix,
-                             int64_t n_runs,
-                             int64_t total,
-                             int64_t first_row,
-                             int64_t n_rows,
-                             uint32_t* words)
+__global__ void scatter_chunks(const uint32_t* const* __restrict__ starts,
+                               const uint32_t* __restrict__ counts,
+                               const uint32_t* __restrict__ chunks,
+                               uint32_t n_runs,
+                               int64_t first_row,
+                               int64_t n_rows,
+                               uint32_t* __restrict__ words)
 {
-  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
-       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    const int64_t base = prefix[0];
-    int64_t lo = 0, hi = n_runs;
-    while (hi - lo > 1) {
-      int64_t mid = (lo + hi) / 2;
-      if (prefix[mid] - base <= i) {
-        lo = mid;
-      } else {
-        hi = mid;
-      }
+  const uint32_t base = __ldg(chunks);
+  uint32_t lo = 0, hi = n_runs;
+  while (hi - lo > 1) {
+    const uint32_t mid = (lo + hi) / 2;
+    if (__ldg(chunks + mid) - base <= blockIdx.x) {
+      lo = mid;
+    } else {
+      hi = mid;
     }
-    int64_t row = static_cast<int64_t>(starts[lo][i - (prefix[lo] - base)]) - first_row;
-    if (row >= 0 && row < n_rows) { atomicOr(&words[row >> 5], 1u << (row & 31)); }
+  }
+  const uint32_t begin           = (blockIdx.x - (__ldg(chunks + lo) - base)) * kChunk;
+  const uint32_t count           = __ldg(counts + lo);
+  const uint32_t* __restrict__ r = starts[lo];
+  const uint64_t limit           = static_cast<uint64_t>(n_rows);
+  // A thread's rows are loaded together, then set: the loads overlap instead of each waiting for
+  // the atomic before it (the row list cannot alias the bitset, so nothing orders them).
+  constexpr uint32_t kPerThread = kChunk / kBlock;
+  uint32_t row[kPerThread];
+#pragma unroll
+  for (uint32_t k = 0; k < kPerThread; k++) {
+    const uint32_t i = begin + threadIdx.x + k * kBlock;
+    row[k]           = i < count ? __ldg(r + i) : 0xffffffffu;
+  }
+#pragma unroll
+  for (uint32_t k = 0; k < kPerThread; k++) {
+    const uint64_t at = static_cast<uint64_t>(row[k]) - static_cast<uint64_t>(first_row);
+    // A row below first_row wraps past limit; 0xffffffff marks a slot past the run.
+    if (row[k] != 0xffffffffu && at < limit) { atomicOr(&words[at >> 5], 1u << (at & 31)); }
   }
 }
 
@@ -222,41 +240,61 @@ void evaluate(
   auto slot                = [&](int64_t depth) {
     return depth == 0 ? out.data() : scratch + (depth - 1) * words;
   };
-  auto* device_starts = reinterpret_cast<const uint32_t**>(scratch + slot_words);
-  auto* device_prefix =
-    reinterpret_cast<int64_t*>(scratch + slot_words + 2 * std::max<int64_t>(n_runs, 1));
+  // Each run's start, its count and its leaf's prefix of chunk blocks (scatter_chunks).
+  const int64_t run_slots = std::max<int64_t>(n_runs, 1);
+  auto* device_starts     = reinterpret_cast<const uint32_t**>(scratch + slot_words);
+  auto* device_counts     = scratch + slot_words + 2 * run_slots;
+  auto* device_chunks     = device_counts + run_slots;
 
-  // Each leaf's prefix of rows starts from 0; totals are kept for the launches.
-  std::vector<const uint32_t*> starts(std::max<int64_t>(n_runs, 1), nullptr);
-  std::vector<int64_t> prefix(std::max<int64_t>(n_runs, 1), 0);
+  std::vector<const uint32_t*> starts(run_slots, nullptr);
+  std::vector<uint32_t> counts(run_slots, 0), chunks(run_slots, 0);
+  auto chunks_of = [](int64_t count) {
+    return static_cast<uint32_t>((count + kChunk - 1) / kChunk);
+  };
   for (int64_t r = 0; r < n_runs; r++) {
+    RAFT_EXPECTS(runs(r).count < (int64_t{1} << 32) - kChunk,
+                 "postings::evaluate: run %ld of %ld rows",
+                 static_cast<long>(r),
+                 static_cast<long>(runs(r).count));
     starts[r] = lists(runs(r).list).data_handle() + runs(r).first;
+    counts[r] = static_cast<uint32_t>(runs(r).count);
   }
-  std::vector<int64_t> totals(program.extent(0), 0);
+  std::vector<uint32_t> blocks(program.extent(0), 0);
   for (int64_t i = 0; i < program.extent(0); i++) {
     const step& s = program(i);
     if (s.kind != step_kind::LEAF) { continue; }
     for (int64_t r = s.first_run; r < s.first_run + s.n_runs; r++) {
-      prefix[r] = totals[i];
-      totals[i] += runs(r).count;
+      chunks[r] = blocks[i];
+      blocks[i] += chunks_of(runs(r).count);
     }
   }
   if (n_runs > 0) {
-    RAFT_CUDA_TRY(cudaMemcpyAsync(
-      device_starts, starts.data(), n_runs * sizeof(starts[0]), cudaMemcpyHostToDevice, stream));
-    RAFT_CUDA_TRY(cudaMemcpyAsync(
-      device_prefix, prefix.data(), n_runs * sizeof(prefix[0]), cudaMemcpyHostToDevice, stream));
+    // One copy: the starts, counts and chunk prefixes are contiguous in the workspace.
+    std::vector<uint32_t> staged(4 * run_slots, 0);
+    std::memcpy(staged.data(), starts.data(), n_runs * sizeof(starts[0]));
+    std::memcpy(staged.data() + 2 * run_slots, counts.data(), n_runs * sizeof(counts[0]));
+    std::memcpy(staged.data() + 3 * run_slots, chunks.data(), n_runs * sizeof(chunks[0]));
+    RAFT_CUDA_TRY(cudaMemcpyAsync(scratch + slot_words,
+                                  staged.data(),
+                                  staged.size() * sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream));
   }
 
   auto combine = [&](uint32_t* a, const uint32_t* b, int op) {
     combine_words<<<blocks_for(words), kBlock, 0, stream>>>(a, b, words, op, tail);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
   };
-  auto scatter = [&](uint32_t* dest, int64_t first, int64_t n, int64_t total) {
+  auto scatter = [&](uint32_t* dest, int64_t first, int64_t n, uint32_t nblocks) {
     RAFT_CUDA_TRY(cudaMemsetAsync(dest, 0, words * sizeof(uint32_t), stream));
-    if (total == 0) { return; }
-    scatter_runs<<<blocks_for(total), kBlock, 0, stream>>>(
-      device_starts + first, device_prefix + first, n, total, first_row, n_rows, dest);
+    if (nblocks == 0) { return; }
+    scatter_chunks<<<nblocks, kBlock, 0, stream>>>(device_starts + first,
+                                                   device_counts + first,
+                                                   device_chunks + first,
+                                                   static_cast<uint32_t>(n),
+                                                   first_row,
+                                                   n_rows,
+                                                   dest);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
   };
 
@@ -266,12 +304,12 @@ void evaluate(
     switch (s.kind) {
       case step_kind::LEAF: {
         uint32_t* a = slot(depth);
-        scatter(a, s.first_run, s.n_runs, totals[i]);
+        scatter(a, s.first_run, s.n_runs, blocks[i]);
         if (s.complement) { combine(a, nullptr, kOpNot); }
         if (s.exclude_run >= 0) {
           // The excluded run's rows, scattered into the slot above, then removed.
           uint32_t* b = slot(depth + 1);
-          scatter(b, s.exclude_run, 1, runs(s.exclude_run).count);
+          scatter(b, s.exclude_run, 1, chunks_of(runs(s.exclude_run).count));
           combine(a, b, kOpAndNot);
         }
         depth++;
