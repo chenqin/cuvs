@@ -12,6 +12,7 @@
 #include <cuvs/neighbors/ivf_pq.hpp>
 #include <cuvs/neighbors/nn_descent.hpp>
 #include <cuvs/preprocessing/quantize/bbq.hpp>
+#include <cuvs/preprocessing/quantize/fp8.hpp>
 #include <cuvs/util/file_io.hpp>
 
 #include <raft/core/device_mdarray.hpp>
@@ -78,6 +79,57 @@ enum class filter_expansion_mode {
    * start nodes; scan the passing rows instead. Multi-partition search ignores this mode.
    */
   PASSING_TWO_HOP = 1
+};
+
+/**
+ * How a search finds its candidates: by walking the graph, or by the FP8 filtered scan.
+ *
+ * The scan scores every row the filter passes from FP8 codes of the index's rows
+ * (`index::update_scan_codes`), for all the queries of the call at once, keeps `scan_candidates`
+ * of them per query, and re-scores those from the index's FP16 rows. Its work is one pass over the
+ * passing rows, shared by the queries of the call, so it suits filters that pass few rows, where a
+ * graph walk spends most of its work on rows it cannot return. The graph parameters are not used.
+ *
+ * The scan can run a search when all of these hold:
+ * - the index holds FP16 rows densely in device memory (a padded or standard device dataset) and
+ *   has scan codes for every one of its rows;
+ * - the metric is L2Expanded or L2Unexpanded, the dimension is at most 512, and k is 1 to 4096;
+ * - the index has no source indices, and the search has no `query_bitsets`;
+ * - the filter is a `filtering::bitset_filter` over at least `size()` rows, a
+ *   `filtering::row_list_filter`, or no filter (every row);
+ * - this build of cuVS holds scan kernels for the device (a kernel image for sm_89 or newer).
+ *
+ * A `filtering::row_list_filter` works on both routes: the scan reads the listed rows, and a search
+ * that walks the graph turns the list into a bitset of `size()` rows first.
+ *
+ * Results of the scan: neighbors are row numbers of the index, distances are squared L2, and slots
+ * past the rows that pass hold 0xFFFFFFFF (4294967295 in an int64 output) and the largest float
+ * distance. The graph search marks such slots with ids at or above size() too, but not always with
+ * the same value, so treat any id at or above size() as empty. The scan keeps its candidates by FP8
+ * distance, so among candidates tied in FP8 distance at the cut, which are kept can change between
+ * identical calls, and with them the last results of a query.
+ *
+ * Searches of several indexes or batches never scan: multi-partition search, composite indexes of
+ * several children, tiered indexes, dynamic batching and multi-GPU search walk the graph, and they
+ * refuse SCAN, `scan_retry` and a `filtering::row_list_filter`.
+ */
+enum class filtered_route_mode {
+  /** Walk the graph, as the other search parameters say. */
+  GRAPH = 0,
+  /**
+   * Scan whenever the scan can run the search; fail, saying why, when it cannot. Without a filter
+   * it scans every row.
+   */
+  SCAN = 1,
+  /**
+   * Scan when the scan can run the search, a filter is given, and at most `scan_max_pass_rate` of
+   * the rows pass it; walk the graph otherwise, and also when the scan runs out of memory. An index
+   * without scan codes always walks the graph, so the default leaves its searches as they are. An
+   * index without a graph (one with a dataset and an empty graph, such as an index constructed from
+   * a metric and then given a dataset with `update_dataset`) can be searched by the scan only:
+   * there AUTO scans whenever the scan can run, filtered or not, and the search fails otherwise.
+   */
+  AUTO = 100
 };
 
 struct search_params : cuvs::neighbors::search_params {
@@ -180,6 +232,56 @@ struct search_params : cuvs::neighbors::search_params {
   /** Data type of the query vector and codebook table on shared memory. Currently, only VPQ
    * supports FP8. **/
   internal_dtype smem_dtype = internal_dtype::F16;
+
+  /** Graph walk or FP8 filtered scan: see `filtered_route_mode`. */
+  filtered_route_mode filtered_route = filtered_route_mode::AUTO;
+
+  /**
+   * AUTO scans when at most this share of the index's rows pass the filter. Note the inversion:
+   * this is the share that passes, while `filtering_rate` is the share filtered out. The share is
+   * the length of a `filtering::row_list_filter` over `size()`, else `1 - filtering_rate` when
+   * `filtering_rate` is greater than 0, else the bitset's count of set bits over `size()`. The
+   * count is taken on the device, and only for an index with scan codes when every other condition
+   * of the scan holds (also under PASSING_TWO_HOP); when AUTO then walks the graph with SCORE_ALL,
+   * the walk takes its filtering rate from that count instead of counting again.
+   */
+  float scan_max_pass_rate = 0.25f;
+
+  /**
+   * Candidates per query the scan keeps from its FP8 distances and re-scores from the FP16 rows: at
+   * least k, at most 4096 and the rows that pass. 0 takes k + max(16, 3 k). More candidates cost
+   * little and raise recall.
+   */
+  uint32_t scan_candidates = 0;
+
+  /**
+   * The caller's claim that the last 16-dimension block of the scan codes and of the queries holds
+   * one coordinate, with the same value in every row and every query (for example unit vectors
+   * augmented for cosine as L2, with a dimension one more than a multiple of 16). The scan then
+   * leaves that block out of its FP8 distances: the coordinate moves every distance of a query by
+   * the same amount, so the scan's order is kept, and the re-scoring from the FP16 rows restores
+   * the exact distance. A wrong claim changes which candidates the scan keeps, not only the
+   * distances. The graph walk ignores it.
+   */
+  bool scan_skip_last_block = false;
+
+  /**
+   * When not null, a device array of one flag per query, and the scan does not wait on the GPU to
+   * check its sampled cutoff. It writes 1 for each query whose cutoff kept too few or too many rows
+   * (whose results are then not exact: search it again with `scan_full_selection`) and 0 for the
+   * others. When null, the scan waits for that check itself and selects again where it fails.
+   * The array must stay valid until the search's work on the stream has finished. A search that
+   * walks the graph sets every flag to 0. Single-index search only: multi-partition search,
+   * composite indexes of several children, tiered indexes, dynamic batching and multi-GPU search
+   * refuse it.
+   */
+  uint32_t* scan_retry = nullptr;
+
+  /**
+   * Score every row the scan reads and select from all of them, without the sampled cutoff:
+   * slower, never flagged in `scan_retry`. For searching again the queries `scan_retry` flagged.
+   */
+  bool scan_full_selection = false;
 };
 
 /**
@@ -619,6 +721,77 @@ struct CUVS_EXPORT index : cuvs::neighbors::index {
              : std::nullopt;
   }
 
+  /** FP8 codes of the rows for the filtered scan, when attached (`update_scan_codes`). */
+  [[nodiscard]] inline auto scan_codes() const noexcept
+    -> std::optional<cuvs::preprocessing::quantize::fp8::quantizer_view>
+  {
+    return scan_codes_;
+  }
+
+  /**
+   * @brief Attach FP8 codes of the index's rows for the filtered scan (`filtered_route_mode`).
+   *
+   * The scan scores rows from these codes and re-scores its candidates from the index's FP16 rows.
+   * The index keeps the view, not a copy, as `update_graph` does with a device view: the caller
+   * keeps the codes and the row scales alive and unchanged while the index is searched. The codes
+   * are not serialized. A new dataset drops them: `extend`, `cagra::update_dataset`, the file
+   * descriptor `update_dataset`, `deserialize` and `merge` leave an index without codes, while
+   * moving the index keeps them.
+   *
+   * @code{.cpp}
+   *   namespace fp8 = cuvs::preprocessing::quantize::fp8;
+   *   fp8::quantizer codes(res, index.size(), index.dim());
+   *   fp8::transform(res, dataset, codes);
+   *   index.update_scan_codes(res, codes.view());
+   * @endcode
+   *
+   * @param[in] res raft resources
+   * @param[in] codes one row of codes and one scale for each row of the index, in the layout
+   *   `cuvs::preprocessing::quantize::fp8::transform` writes: `codes.codes` [size(), width] with a
+   *   width that is a multiple of 16 and at least `fp8::get_encoded_row_length(dim())`, 16-byte
+   *   aligned; `codes.row_scales` [size()], 4-byte aligned; both on the device of the index. The
+   *   index must hold FP16 rows densely in device memory, fewer than 2^32 of them.
+   */
+  void update_scan_codes(raft::resources const& res,
+                         cuvs::preprocessing::quantize::fp8::quantizer_view codes)
+  {
+    if constexpr (!std::is_same_v<T, half> ||
+                  !cuvs::neighbors::is_dense_row_major_device_dataset_view_v<DatasetViewT>) {
+      RAFT_FAIL("update_scan_codes: the FP8 scan takes FP16 indexes with dense device rows");
+    } else {
+      const auto rows = static_cast<int64_t>(size());
+      RAFT_EXPECTS(!dataset_fd_.has_value() && dataset_.n_rows() == rows,
+                   "update_scan_codes: the index's rows are not in device memory");
+      RAFT_EXPECTS(rows < (int64_t{1} << 32),
+                   "update_scan_codes: the FP8 scan takes indexes of fewer than 2^32 rows");
+      RAFT_EXPECTS(codes.codes.extent(0) == rows && codes.row_scales.extent(0) == rows,
+                   "update_scan_codes: %ld code rows and %ld row scales for an index of %ld rows",
+                   static_cast<long>(codes.codes.extent(0)),
+                   static_cast<long>(codes.row_scales.extent(0)),
+                   static_cast<long>(rows));
+      const int64_t width = codes.codes.extent(1);
+      RAFT_EXPECTS(
+        width % 16 == 0 &&
+          width >= cuvs::preprocessing::quantize::fp8::get_encoded_row_length(dim()),
+        "update_scan_codes: code rows of %ld bytes, not a multiple of 16 of at least %u for %u "
+        "dimensions",
+        static_cast<long>(width),
+        cuvs::preprocessing::quantize::fp8::get_encoded_row_length(dim()),
+        dim());
+      RAFT_EXPECTS(rows == 0 || (codes.codes.data_handle() != nullptr &&
+                                 codes.row_scales.data_handle() != nullptr),
+                   "update_scan_codes: null codes or row scales");
+      RAFT_EXPECTS(reinterpret_cast<uintptr_t>(codes.codes.data_handle()) % 16 == 0,
+                   "update_scan_codes: the codes must be 16-byte aligned");
+      RAFT_EXPECTS(reinterpret_cast<uintptr_t>(codes.row_scales.data_handle()) % 4 == 0,
+                   "update_scan_codes: the row scales must be 4-byte aligned");
+      scan_codes_ = codes;
+    }
+  }
+
+  /** Detach the FP8 codes of `update_scan_codes`: the scan no longer applies to the index. */
+  void reset_scan_codes() noexcept { scan_codes_.reset(); }
+
   /** Get the dataset file descriptor (for disk-backed index) */
   [[nodiscard]] inline auto dataset_fd() const noexcept
     -> const std::optional<cuvs::util::file_descriptor>&
@@ -737,7 +910,9 @@ struct CUVS_EXPORT index : cuvs::neighbors::index {
       mapping_fd_(std::move(other.mapping_fd_)),
       n_rows_(other.n_rows_),
       dim_(other.dim_),
-      graph_degree_(other.graph_degree_)
+      graph_degree_(other.graph_degree_),
+      // Codes describe the old rows: a new dataset needs new codes.
+      scan_codes_(std::nullopt)
   {
     if constexpr (is_device_dataset_view_v<DatasetViewT>) {
       if (metric() == cuvs::distance::DistanceType::CosineExpanded) {
@@ -872,6 +1047,7 @@ struct CUVS_EXPORT index : cuvs::neighbors::index {
       RAFT_FAIL("update_dataset(fd): unsupported DatasetViewT for disk-backed dataset");
     }
     dataset_norms_.reset();
+    reset_scan_codes();
   }
 
   /**
@@ -990,6 +1166,9 @@ struct CUVS_EXPORT index : cuvs::neighbors::index {
   size_t n_rows_       = 0;
   size_t dim_          = 0;
   size_t graph_degree_ = 0;
+  // FP8 codes of the rows for the filtered scan (non-owning). Declared last, so that the members
+  // before it keep their offsets.
+  std::optional<cuvs::preprocessing::quantize::fp8::quantizer_view> scan_codes_;
 };
 
 /** CAGRA index with the usual padded device dataset view (graph build output type). */

@@ -5,23 +5,29 @@
 
 #include "test_utils.cuh"
 #include "../../src/core/interop.hpp"
+#include "../../../cpp/src/neighbors/detail/cagra/fp8_scan.hpp"
 #include <array>
 #include <cstddef>
 #include <cuvs/core/c_api.h>
 #include <cuvs/core/dataset.h>
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/preprocessing/quantize/bbq.h>
+#include <cuvs/preprocessing/quantize/fp8.h>
 #include <dlpack/dlpack.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <cstring>
 #include <cuvs/neighbors/cagra.h>
 #include <cuvs/neighbors/hnsw.h>
+#include <random>
 #include <string>
 #include <type_traits>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -1126,6 +1132,257 @@ TEST(CagraC, BuildSearchFilterExpansion)
   cuvsCagraIndexParamsDestroy(build_params);
   cuvsCagraIndexDestroy(index);
   cuvsResourcesDestroy(res);
+}
+
+// The FP8 filtered scan through the C API: the route and scan fields of cuvsCagraSearchParams,
+// codes from cuvsFp8QuantizerTransform attached with cuvsCagraUpdateScanCodes, BITSET and ROW_LIST
+// filters on both routes, an index without a graph from cuvsCagraIndexFromArgs, and the refusals
+// of multi-partition search.
+TEST(CagraC, BuildSearchFilteredScan)
+{
+  cuvsResources_t res;
+  ASSERT_EQ(cuvsResourcesCreate(&res), CUVS_SUCCESS);
+  if (!cuvs::neighbors::cagra::detail::fp8_scan::is_supported(
+        *reinterpret_cast<raft::resources*>(res))) {
+    cuvsResourcesDestroy(res);
+    GTEST_SKIP() << "this build holds no FP8 scan kernels for the device";
+  }
+  cudaStream_t stream;
+  ASSERT_EQ(cuvsStreamGet(res, &stream), CUVS_SUCCESS);
+
+  // The defaults of cuvsCagraSearchParamsCreate; a zeroed struct takes the graph route.
+  cuvsCagraSearchParams_t params;
+  ASSERT_EQ(cuvsCagraSearchParamsCreate(&params), CUVS_SUCCESS);
+  EXPECT_EQ(params->filtered_route, CUVS_CAGRA_FILTERED_ROUTE_AUTO);
+  EXPECT_EQ(params->scan_max_pass_rate, 0.25f);
+  EXPECT_EQ(params->scan_candidates, 0u);
+  EXPECT_FALSE(params->scan_skip_last_block);
+  EXPECT_EQ(params->scan_retry, (uintptr_t)0);
+  EXPECT_FALSE(params->scan_full_selection);
+  EXPECT_EQ(CUVS_CAGRA_FILTERED_ROUTE_GRAPH, 0);
+
+  // A row of codes is the dimension rounded up to 16 bytes.
+  uint32_t width = 0;
+  EXPECT_EQ(cuvsFp8QuantizerEncodedRowLength(1, &width), CUVS_SUCCESS);
+  EXPECT_EQ(width, 16u);
+  EXPECT_EQ(cuvsFp8QuantizerEncodedRowLength(16, &width), CUVS_SUCCESS);
+  EXPECT_EQ(width, 16u);
+  EXPECT_EQ(cuvsFp8QuantizerEncodedRowLength(33, &width), CUVS_SUCCESS);
+  EXPECT_EQ(width, 48u);
+  EXPECT_EQ(cuvsFp8QuantizerEncodedRowLength(16, nullptr), CUVS_ERROR);
+
+  // FP16 rows of 24 dimensions (48 bytes, the width CAGRA pads them to) and queries; rows 3, 11,
+  // 19, ... pass the filter, given as a bitset and as the list of their numbers.
+  constexpr int64_t n_rows = 512, dim = 24, n_queries = 8, k = 4, n_words = n_rows / 32;
+  std::mt19937 gen(1234);
+  std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+  std::vector<half> host_rows(n_rows * dim), host_queries(n_queries * dim);
+  for (auto& x : host_rows) {
+    x = __float2half(uniform(gen));
+  }
+  for (auto& x : host_queries) {
+    x = __float2half(uniform(gen));
+  }
+  std::vector<uint32_t> host_bits(n_words, 0u), host_list;
+  for (uint32_t i = 3; i < n_rows; i += 8) {
+    host_bits[i / 32] |= 1u << (i % 32);
+    host_list.push_back(i);
+  }
+  rmm::device_uvector<half> rows_d(host_rows.size(), stream);
+  rmm::device_uvector<half> queries_d(host_queries.size(), stream);
+  rmm::device_uvector<uint32_t> bits_d(host_bits.size(), stream);
+  rmm::device_uvector<uint32_t> list_d(host_list.size(), stream);
+  raft::copy(rows_d.data(), host_rows.data(), host_rows.size(), stream);
+  raft::copy(queries_d.data(), host_queries.data(), host_queries.size(), stream);
+  raft::copy(bits_d.data(), host_bits.data(), host_bits.size(), stream);
+  raft::copy(list_d.data(), host_list.data(), host_list.size(), stream);
+
+  rmm::device_uvector<uint32_t> neighbors_d(n_queries * k, stream);
+  rmm::device_uvector<float> distances_d(n_queries * k, stream);
+  auto rows_tensor      = make_device_matrix_tensor(rows_d.data(), n_rows, dim);
+  auto queries_tensor   = make_device_matrix_tensor(queries_d.data(), n_queries, dim);
+  auto neighbors_tensor = make_device_matrix_tensor(neighbors_d.data(), n_queries, k);
+  auto distances_tensor = make_device_matrix_tensor(distances_d.data(), n_queries, k);
+  auto bits_tensor      = make_device_vector_tensor(bits_d.data(), n_words);
+  auto list_tensor =
+    make_device_vector_tensor(list_d.data(), static_cast<int64_t>(host_list.size()));
+  cuvsFilter no_filter{.addr = 0, .type = NO_FILTER};
+  cuvsFilter bitset{.addr = (uintptr_t)&bits_tensor, .type = BITSET};
+  cuvsFilter row_list{.addr = (uintptr_t)&list_tensor, .type = ROW_LIST};
+
+  auto search = [&](cuvsCagraSearchParams_t p, cuvsCagraIndex_t idx, cuvsFilter f) {
+    return cuvsCagraSearch(res, p, idx, &queries_tensor, &neighbors_tensor, &distances_tensor, f);
+  };
+  auto results = [&] {
+    std::pair<std::vector<uint32_t>, std::vector<float>> out{std::vector<uint32_t>(n_queries * k),
+                                                             std::vector<float>(n_queries * k)};
+    raft::copy(out.first.data(), neighbors_d.data(), out.first.size(), stream);
+    raft::copy(out.second.data(), distances_d.data(), out.second.size(), stream);
+    EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    return out;
+  };
+  auto last_error_has = [](const char* what) {
+    return std::string(cuvsGetLastErrorText()).find(what) != std::string::npos;
+  };
+  // With every row it reads a candidate, the scan returns the k nearest of them by the FP16
+  // values: the rows that pass the filter, or every row.
+  auto expect_exact = [&](bool filtered) {
+    const auto [found, found_distances] = results();
+    for (int64_t q = 0; q < n_queries; q++) {
+      std::vector<std::pair<double, uint32_t>> scored;
+      for (uint32_t i = 0; i < n_rows; i++) {
+        if (filtered && ((host_bits[i / 32] >> (i % 32)) & 1u) == 0) { continue; }
+        double distance = 0;
+        for (int64_t d = 0; d < dim; d++) {
+          const double x = double(__half2float(host_rows[i * dim + d])) -
+                           double(__half2float(host_queries[q * dim + d]));
+          distance += x * x;
+        }
+        scored.emplace_back(distance, i);
+      }
+      std::partial_sort(scored.begin(), scored.begin() + k, scored.end());
+      for (int64_t j = 0; j < k; j++) {
+        EXPECT_EQ(found[q * k + j], scored[j].second) << "query " << q << " neighbor " << j;
+        EXPECT_NEAR(
+          found_distances[q * k + j], scored[j].first, 1e-3 * std::max(1.0, scored[j].first))
+          << "query " << q << " neighbor " << j;
+      }
+    }
+  };
+
+  // A graph index of the rows.
+  cuvsDataset_t rows_view;
+  ASSERT_EQ(cuvsDatasetMakePaddedView(res, &rows_tensor, &rows_view), CUVS_SUCCESS);
+  cuvsCagraIndexParams_t build_params;
+  ASSERT_EQ(cuvsCagraIndexParamsCreate(&build_params), CUVS_SUCCESS);
+  set_small_dataset_build_params(build_params);
+  build_params->graph_degree              = 32;
+  build_params->intermediate_graph_degree = 64;
+  cuvsCagraIndex_t index;
+  ASSERT_EQ(cuvsCagraIndexCreate(&index), CUVS_SUCCESS);
+  ASSERT_EQ(cuvsCagraBuild(res, build_params, rows_view, index), CUVS_SUCCESS);
+
+  // A ROW_LIST walks the graph as the BITSET of its rows. Without codes AUTO walks it too, and
+  // SCAN fails. SINGLE_CTA walks each query in one CTA, so that equal walks give equal results.
+  params->algo           = SINGLE_CTA;
+  params->filtered_route = CUVS_CAGRA_FILTERED_ROUTE_GRAPH;
+  ASSERT_EQ(search(params, index, bitset), CUVS_SUCCESS);
+  const auto walked = results();
+  ASSERT_EQ(search(params, index, row_list), CUVS_SUCCESS);
+  EXPECT_EQ(results(), walked);
+  params->filtered_route = CUVS_CAGRA_FILTERED_ROUTE_AUTO;
+  ASSERT_EQ(search(params, index, bitset), CUVS_SUCCESS);
+  EXPECT_EQ(results(), walked);
+  params->filtered_route = CUVS_CAGRA_FILTERED_ROUTE_SCAN;
+  EXPECT_EQ(search(params, index, bitset), CUVS_ERROR);
+  EXPECT_TRUE(last_error_has("scan codes"));
+
+  // FP8 codes of the rows, from device rows only.
+  ASSERT_EQ(cuvsFp8QuantizerEncodedRowLength(dim, &width), CUVS_SUCCESS);
+  ASSERT_EQ(width, 32u);
+  rmm::device_uvector<uint8_t> codes_d(n_rows * width, stream);
+  rmm::device_uvector<float> scales_d(n_rows, stream);
+  auto codes_tensor                = make_device_matrix_tensor(codes_d.data(), n_rows, width);
+  auto scales_tensor               = make_device_vector_tensor(scales_d.data(), n_rows);
+  DLManagedTensor host_rows_tensor = rows_tensor;
+  host_rows_tensor.dl_tensor.data  = host_rows.data();
+  host_rows_tensor.dl_tensor.device.device_type = kDLCPU;
+  host_rows_tensor.deleter                      = nullptr;
+  EXPECT_EQ(cuvsFp8QuantizerTransform(res, &host_rows_tensor, &codes_tensor, &scales_tensor),
+            CUVS_ERROR);
+  ASSERT_EQ(cuvsFp8QuantizerTransform(res, &rows_tensor, &codes_tensor, &scales_tensor),
+            CUVS_SUCCESS);
+
+  // Codes without row scales, or of another row count, are refused: SCAN still fails.
+  EXPECT_EQ(cuvsCagraUpdateScanCodes(res, &codes_tensor, nullptr, index), CUVS_ERROR);
+  auto short_codes = make_device_matrix_tensor(codes_d.data(), n_rows - 1, width);
+  EXPECT_EQ(cuvsCagraUpdateScanCodes(res, &short_codes, &scales_tensor, index), CUVS_ERROR);
+  EXPECT_EQ(search(params, index, bitset), CUVS_ERROR);
+  ASSERT_EQ(cuvsCagraUpdateScanCodes(res, &codes_tensor, &scales_tensor, index), CUVS_SUCCESS);
+
+  // SCAN, with every passing row a candidate, gives the exact neighbors from the BITSET as from
+  // the ROW_LIST of its rows. An unknown route fails the search.
+  params->scan_candidates = 4096;
+  ASSERT_EQ(search(params, index, bitset), CUVS_SUCCESS);
+  expect_exact(true);
+  ASSERT_EQ(search(params, index, row_list), CUVS_SUCCESS);
+  expect_exact(true);
+  params->filtered_route = static_cast<cuvsCagraFilteredRoute>(7);
+  EXPECT_EQ(search(params, index, bitset), CUVS_ERROR);
+  EXPECT_TRUE(last_error_has("unknown filtered_route"));
+
+  // NULL codes detach them: SCAN fails again.
+  ASSERT_EQ(cuvsCagraUpdateScanCodes(res, nullptr, nullptr, index), CUVS_SUCCESS);
+  params->filtered_route = CUVS_CAGRA_FILTERED_ROUTE_SCAN;
+  EXPECT_EQ(search(params, index, bitset), CUVS_ERROR);
+  EXPECT_TRUE(last_error_has("scan codes"));
+
+  // An index of the rows and no graph, which only the scan searches. A zeroed struct walks the
+  // graph, which it does not have, with codes or without.
+  cuvsCagraIndex_t free_index;
+  ASSERT_EQ(cuvsCagraIndexCreate(&free_index), CUVS_SUCCESS);
+  ASSERT_EQ(cuvsCagraIndexFromArgs(res, L2Expanded, nullptr, &rows_tensor, free_index),
+            CUVS_SUCCESS);
+  cuvsCagraSearchParams zeroed{};
+  EXPECT_EQ(search(&zeroed, free_index, bitset), CUVS_ERROR);
+  EXPECT_TRUE(last_error_has("no graph"));
+  ASSERT_EQ(cuvsCagraUpdateScanCodes(res, &codes_tensor, &scales_tensor, free_index), CUVS_SUCCESS);
+  EXPECT_EQ(search(&zeroed, free_index, bitset), CUVS_ERROR);
+  EXPECT_TRUE(last_error_has("no graph"));
+  ASSERT_EQ(search(params, free_index, bitset), CUVS_SUCCESS);
+  expect_exact(true);
+  params->filtered_route = CUVS_CAGRA_FILTERED_ROUTE_AUTO;
+  ASSERT_EQ(search(params, free_index, no_filter), CUVS_SUCCESS);
+  expect_exact(false);
+  // There is no graph to write either, and no file is made.
+  const auto path = "/tmp/cuvs-cagra-no-graph-" + std::to_string(getpid()) + ".bin";
+  EXPECT_EQ(cuvsCagraSerializeGraphAndDataset(res, path.c_str(), free_index), CUVS_ERROR);
+  EXPECT_TRUE(last_error_has("no graph"));
+  EXPECT_EQ(cuvsCagraSerializeToHnswlib(res, path.c_str(), free_index), CUVS_ERROR);
+  EXPECT_TRUE(last_error_has("no graph"));
+  EXPECT_FALSE(std::filesystem::exists(path));
+
+  // Multi-partition search walks every partition's graph: it searches under AUTO, and refuses
+  // SCAN and a ROW_LIST.
+  cuvsCagraIndex_t parts[2] = {index, index};
+  rmm::device_uvector<uint32_t> partition_ids_d(n_queries * k, stream);
+  auto partition_ids_tensor = make_device_matrix_tensor(partition_ids_d.data(), n_queries, k);
+  auto search_parts         = [&](cuvsCagraSearchParams_t p, cuvsFilter* filters) {
+    return cuvsCagraSearchMultiPartition(res,
+                                         p,
+                                         2,
+                                         parts,
+                                         &queries_tensor,
+                                         &partition_ids_tensor,
+                                         &neighbors_tensor,
+                                         &distances_tensor,
+                                         filters);
+  };
+  params->scan_candidates = 0;
+  EXPECT_EQ(search_parts(params, nullptr), CUVS_SUCCESS);
+  cuvsFilter list_filters[2] = {row_list, row_list};
+  EXPECT_EQ(search_parts(params, list_filters), CUVS_ERROR);
+  EXPECT_TRUE(last_error_has("ROW_LIST"));
+  params->filtered_route = CUVS_CAGRA_FILTERED_ROUTE_SCAN;
+  EXPECT_EQ(search_parts(params, nullptr), CUVS_ERROR);
+  EXPECT_TRUE(last_error_has("multi-partition"));
+
+  free_tensor(rows_tensor);
+  free_tensor(queries_tensor);
+  free_tensor(neighbors_tensor);
+  free_tensor(distances_tensor);
+  free_tensor(bits_tensor);
+  free_tensor(list_tensor);
+  free_tensor(codes_tensor);
+  free_tensor(scales_tensor);
+  free_tensor(short_codes);
+  free_tensor(partition_ids_tensor);
+  ASSERT_EQ(cuvsCagraIndexDestroy(free_index), CUVS_SUCCESS);
+  ASSERT_EQ(cuvsCagraIndexDestroy(index), CUVS_SUCCESS);
+  ASSERT_EQ(cuvsDatasetDestroy(rows_view), CUVS_SUCCESS);
+  ASSERT_EQ(cuvsCagraIndexParamsDestroy(build_params), CUVS_SUCCESS);
+  ASSERT_EQ(cuvsCagraSearchParamsDestroy(params), CUVS_SUCCESS);
+  ASSERT_EQ(cuvsResourcesDestroy(res), CUVS_SUCCESS);
 }
 
 TEST(CagraC, BuildMergeSearch)
