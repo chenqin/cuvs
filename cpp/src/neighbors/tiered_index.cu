@@ -50,6 +50,24 @@ cuvs::neighbors::cagra::device_padded_index<float, uint32_t> cagra_build_for_tie
   return cuvs::neighbors::cagra::build(res, params, view);
 }
 
+// A tiered search runs a CAGRA tier and a brute-force tier, so the FP8 filtered scan, which
+// searches one index, does not apply: the CAGRA tier walks its graph, and SCAN, scan_retry and a
+// row list (which the brute-force tier does not take) are refused.
+auto graph_route_params(const cuvs::neighbors::cagra::search_params& search_params,
+                        const cuvs::neighbors::filtering::base_filter& sample_filter)
+  -> cuvs::neighbors::cagra::search_params
+{
+  RAFT_EXPECTS(search_params.filtered_route != cuvs::neighbors::cagra::filtered_route_mode::SCAN,
+               "search_params::filtered_route SCAN is not supported by tiered_index::search");
+  RAFT_EXPECTS(search_params.scan_retry == nullptr,
+               "search_params::scan_retry is not supported by tiered_index::search");
+  RAFT_EXPECTS(sample_filter.get_filter_type() != cuvs::neighbors::filtering::FilterType::RowList,
+               "tiered_index::search does not support row_list_filter");
+  auto graph_params           = search_params;
+  graph_params.filtered_route = cuvs::neighbors::cagra::filtered_route_mode::GRAPH;
+  return graph_params;
+}
+
 }  // namespace
 
 namespace cuvs::neighbors::tiered_index {
@@ -224,9 +242,10 @@ void search(raft::resources const& res,
   // The brute-force tier would still filter every query by the filter object's own bitset.
   RAFT_EXPECTS(search_params.query_bitsets == nullptr,
                "search_params::query_bitsets is not supported by tiered_index::search");
+  auto graph_params = graph_route_params(search_params, sample_filter);
   std::shared_lock<std::shared_mutex> lock(index.ann_mutex);
   index.state->search(
-    res, search_params, cagra::search, queries, neighbors, distances, sample_filter);
+    res, graph_params, cagra::search, queries, neighbors, distances, sample_filter);
 }
 
 void search(raft::resources const& res,
@@ -240,10 +259,11 @@ void search(raft::resources const& res,
   // The brute-force tier would still filter every query by the filter object's own bitset.
   RAFT_EXPECTS(search_params.query_bitsets == nullptr,
                "search_params::query_bitsets is not supported by tiered_index::search");
+  auto graph_params = graph_route_params(search_params, sample_filter);
   std::shared_lock<std::shared_mutex> lock(index.ann_mutex);
   if (!index.state->ann_index) {
     index.state->search(
-      res, search_params, cagra::search, queries, neighbors, distances, sample_filter);
+      res, graph_params, cagra::search, queries, neighbors, distances, sample_filter);
     return;
   }
 
@@ -253,7 +273,7 @@ void search(raft::resources const& res,
   auto padded_dataset = cuvs::neighbors::make_device_padded_dataset(res, vectors);
   auto padded_index   = convert_standard_to_padded_index(res, index, padded_dataset->view());
   padded_index.state->search(
-    res, search_params, cagra::search, queries, neighbors, distances, sample_filter);
+    res, graph_params, cagra::search, queries, neighbors, distances, sample_filter);
 }
 
 void search(raft::resources const& res,

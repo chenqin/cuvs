@@ -273,4 +273,45 @@ TEST(TieredIndexCagra, RejectsQueryBitsets)
   EXPECT_THROW(search(res, search_params, index, queries, neighbors.view(), distances.view()),
                raft::logic_error);
 }
+
+// The CAGRA FP8 filtered scan searches one index, and a tiered search runs two: the CAGRA tier
+// walks its graph, and SCAN, scan_retry and a row_list_filter are refused.
+TEST(TieredIndexCagra, RejectsFilteredScan)
+{
+  raft::resources res;
+  const int64_t n_rows = 64, dim = 16, n_queries = 2, k = 4;
+  auto database = raft::make_device_matrix<float, int64_t>(res, n_rows, dim);
+  raft::random::RngState r(42ULL);
+  raft::random::normal(res, r, database.data_handle(), n_rows * dim, 0.1f, 2.0f);
+
+  index_params<cagra::index_params> build_params;
+  auto index = build(res, build_params, raft::make_const_mdspan(database.view()));
+
+  auto queries =
+    raft::make_device_matrix_view<const float, int64_t>(database.data_handle(), n_queries, dim);
+  auto neighbors    = raft::make_device_matrix<int64_t, int64_t>(res, n_queries, k);
+  auto distances    = raft::make_device_matrix<float, int64_t>(res, n_queries, k);
+  auto search_tiers = [&](cagra::search_params const& params,
+                          cuvs::neighbors::filtering::base_filter const& sample_filter) {
+    search(res, params, index, queries, neighbors.view(), distances.view(), sample_filter);
+  };
+  const cuvs::neighbors::filtering::none_sample_filter no_filter{};
+
+  cagra::search_params search_params;
+  EXPECT_NO_THROW(search_tiers(search_params, no_filter));
+
+  auto scan           = search_params;
+  scan.filtered_route = cagra::filtered_route_mode::SCAN;
+  EXPECT_THROW(search_tiers(scan, no_filter), raft::logic_error);
+
+  // Neither the flags nor the listed rows are read: the search is refused first.
+  auto retry            = raft::make_device_vector<uint32_t, int64_t>(res, n_queries);
+  auto with_retry       = search_params;
+  with_retry.scan_retry = retry.data_handle();
+  EXPECT_THROW(search_tiers(with_retry, no_filter), raft::logic_error);
+
+  auto rows = raft::make_device_vector<uint32_t, int64_t>(res, 1);
+  const cuvs::neighbors::filtering::row_list_filter row_list(raft::make_const_mdspan(rows.view()));
+  EXPECT_THROW(search_tiers(search_params, row_list), raft::logic_error);
+}
 }  // namespace cuvs::neighbors::tiered_index

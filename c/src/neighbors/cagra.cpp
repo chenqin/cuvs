@@ -17,6 +17,7 @@
 #include <raft/core/mdspan_types.hpp>
 #include <raft/core/numpy_serializer.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resource/device_id.hpp>
 #include <raft/core/numpy_serializer.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/core/serialize.hpp>
@@ -32,6 +33,7 @@
 #include <cuvs/neighbors/common.h>
 #include <cuvs/neighbors/cagra.hpp>
 #include <cuvs/preprocessing/quantize/bbq.h>
+#include <cuvs/preprocessing/quantize/fp8.hpp>
 #include <cuvs/preprocessing/quantize/pq.hpp>
 #include "../core/exceptions.hpp"
 #include "../core/interop.hpp"
@@ -259,7 +261,7 @@ static void merge_indices_for_layout(
       cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(removed_indices_bitset);
     merge_into_dataset(bitset_filter_obj);
   } else {
-    RAFT_FAIL("Unsupported filter type: BITMAP");
+    RAFT_FAIL("Unsupported filter type for cuvsCagraMerge: %d", static_cast<int>(filter.type));
   }
 }
 
@@ -845,6 +847,8 @@ void _from_args(cuvsResources_t res,
   auto dataset = dataset_tensor->dl_tensor;
   auto res_ptr = reinterpret_cast<raft::resources*>(res);
   auto update_graph_from_dlpack = [&](auto* idx) {
+    // Without a graph the index is searched by the FP8 filtered scan only.
+    if (graph_tensor == nullptr) { return; }
     if (cuvs::core::is_dlpack_device_compatible(graph_tensor->dl_tensor)) {
       using graph_mdspan_type = raft::device_matrix_view<uint32_t const, int64_t, raft::row_major>;
       auto graph_mds = cuvs::core::from_dlpack<graph_mdspan_type>(graph_tensor);
@@ -977,8 +981,21 @@ void _search(cuvsResources_t res,
                                        neighbors_mds,
                                        distances_mds,
                                        bitset_filter_obj);
+      } else if (filter.type == ROW_LIST) {
+        using rows_mdspan_type = raft::device_vector_view<const std::uint32_t, int64_t>;
+        auto rows_tensor       = reinterpret_cast<DLManagedTensor*>(filter.addr);
+        RAFT_EXPECTS(rows_tensor != nullptr, "ROW_LIST filter addr must be non-null");
+        auto row_list_filter_obj = cuvs::neighbors::filtering::row_list_filter(
+          cuvs::core::from_dlpack<rows_mdspan_type>(rows_tensor));
+        cuvs::neighbors::cagra::search(*res_ptr,
+                                       search_params,
+                                       idx,
+                                       queries_mds,
+                                       neighbors_mds,
+                                       distances_mds,
+                                       row_list_filter_obj);
       } else {
-        RAFT_FAIL("Unsupported filter type: BITMAP");
+        RAFT_FAIL("Unsupported filter type for cuvsCagraSearch: %d", static_cast<int>(filter.type));
       }
     });
 }
@@ -1063,6 +1080,9 @@ void _search_multi_partition(cuvsResources_t res,
         auto bitset_mds = cuvs::core::from_dlpack<bitset_mdspan_t>(bitset_tensor);
         partition_bitsets[i] =
           bitset_view_t(bitset_mds, static_cast<int64_t>(bitset_mds.size()) * 32);
+      } else if (filters[i].type == ROW_LIST) {
+        // Partitions walk their graphs with per-partition bitsets; a row list is a scan filter.
+        RAFT_FAIL("ROW_LIST filters are not supported by multi-partition search (partition %u)", i);
       } else {
         RAFT_FAIL("Unsupported filter type for multi-partition search (partition %u): %d",
                   i,
@@ -1506,6 +1526,15 @@ void convert_c_search_params(cuvsCagraSearchParams params,
   out->filter_expansion =
     static_cast<cuvs::neighbors::cagra::filter_expansion_mode>(params.filter_expansion);
   out->query_bitsets = reinterpret_cast<const uint32_t* const*>(params.query_bitsets);
+  // A zeroed C struct means CUVS_CAGRA_FILTERED_ROUTE_GRAPH; an unknown value fails the search.
+  out->filtered_route =
+    static_cast<cuvs::neighbors::cagra::filtered_route_mode>(params.filtered_route);
+  // 0 or less takes the default, so a zeroed C struct keeps it.
+  out->scan_max_pass_rate = params.scan_max_pass_rate > 0.0f ? params.scan_max_pass_rate : 0.25f;
+  out->scan_candidates    = params.scan_candidates;
+  out->scan_skip_last_block = params.scan_skip_last_block;
+  out->scan_retry           = reinterpret_cast<uint32_t*>(params.scan_retry);
+  out->scan_full_selection  = params.scan_full_selection;
 }
 
 void* cagra_c_api_index_ptr(cuvsCagraIndex const* idx)
@@ -1900,6 +1929,60 @@ extern "C" cuvsError_t cuvsCagraUpdateDataset(cuvsResources_t res,
   return dispatch_update_dataset(res, dataset, index);
 }
 
+extern "C" cuvsError_t cuvsCagraUpdateScanCodes(cuvsResources_t res,
+                                                DLManagedTensor* codes,
+                                                DLManagedTensor* row_scales,
+                                                cuvsCagraIndex_t index)
+{
+  return cuvs::core::translate_exceptions([=] {
+    RAFT_EXPECTS(index != nullptr && index->addr != 0,
+                 "cuvsCagraUpdateScanCodes: null index handle");
+    RAFT_EXPECTS(index->dtype.code == kDLFloat && index->dtype.bits == 16,
+                 "cuvsCagraUpdateScanCodes: the FP8 scan takes FP16 indexes only");
+    auto* res_ptr = reinterpret_cast<raft::resources*>(res);
+    auto* box     = reinterpret_cast<sg_cagra_c_api_index_box*>(index->addr);
+    with_index_by_layout<half, uint32_t, false, false>(
+      box,
+      "cuvsCagraUpdateScanCodes: null index handle",
+      "cuvsCagraUpdateScanCodes: the index must hold a device padded dataset; attach one with "
+      "cuvsCagraUpdateDataset",
+      [&](auto& idx) {
+        using index_t = std::decay_t<decltype(idx)>;
+        if constexpr (!std::is_same_v<
+                        index_t,
+                        cuvs::neighbors::cagra::device_padded_index<half, uint32_t>>) {
+          RAFT_FAIL(
+            "cuvsCagraUpdateScanCodes: the index must hold a device padded dataset; attach one "
+            "with cuvsCagraUpdateDataset");
+        } else {
+          if (codes == nullptr) {
+            idx.reset_scan_codes();
+            return;
+          }
+          RAFT_EXPECTS(row_scales != nullptr, "cuvsCagraUpdateScanCodes: null row scales");
+          const int device = raft::resource::get_device_id(*res_ptr);
+          for (auto* tensor : {codes, row_scales}) {
+            const auto& dl = tensor->dl_tensor;
+            RAFT_EXPECTS(cuvs::core::is_dlpack_device_compatible(dl),
+                         "cuvsCagraUpdateScanCodes: the codes and row scales must be in device "
+                         "memory");
+            RAFT_EXPECTS(dl.device.device_type != kDLCUDA || dl.device.device_id == device,
+                         "cuvsCagraUpdateScanCodes: the codes and row scales must be on device "
+                         "%d, the device of the resources",
+                         device);
+          }
+          using codes_mdspan_type =
+            raft::device_matrix_view<const uint8_t, int64_t, raft::row_major>;
+          using scales_mdspan_type = raft::device_vector_view<const float, int64_t>;
+          idx.update_scan_codes(*res_ptr,
+                                cuvs::preprocessing::quantize::fp8::quantizer_view{
+                                  cuvs::core::from_dlpack<codes_mdspan_type>(codes),
+                                  cuvs::core::from_dlpack<scales_mdspan_type>(row_scales)});
+        }
+      });
+  });
+}
+
 /**
  * Build from an already-constructed C++ dataset view. `DatasetViewT` selects the
  * `cuvs::neighbors::cagra::build` overload, and therefore the resulting index type.
@@ -2024,6 +2107,8 @@ extern "C" cuvsError_t cuvsCagraIndexFromArgs(cuvsResources_t res,
                                               cuvsCagraIndex_t index)
 {
   return cuvs::core::translate_exceptions([=] {
+    // graph may be NULL (an index for the FP8 filtered scan only); dataset may not.
+    RAFT_EXPECTS(dataset_tensor != nullptr, "cuvsCagraIndexFromArgs: null dataset");
     auto dataset = dataset_tensor->dl_tensor;
     destroy_sg_cagra_c_api_box(index->addr);
     index->addr         = 0;
@@ -2431,6 +2516,12 @@ extern "C" cuvsError_t cuvsCagraSearchParamsCreate(cuvsCagraSearchParams_t* para
       .filtering_rate          = 0.0,
       .filter_expansion        = CUVS_CAGRA_FILTER_SCORE_ALL,
       .query_bitsets           = 0,
+      .filtered_route          = CUVS_CAGRA_FILTERED_ROUTE_AUTO,
+      .scan_max_pass_rate      = 0.25,
+      .scan_candidates         = 0,
+      .scan_skip_last_block    = false,
+      .scan_retry              = 0,
+      .scan_full_selection     = false,
     };
   });
 }

@@ -48,5 +48,6 @@
 #include <cuvs/preprocessing/quantize/bbq.h>
 #include <cuvs/preprocessing/quantize/pq.h>
 #include <cuvs/preprocessing/quantize/scalar.h>
+#include <cuvs/preprocessing/quantize/fp8.h>
 
 #include <cuvs/selection/select_k.h>

@@ -277,6 +277,13 @@ ConfigureTest(
 )
 
 ConfigureTest(
+  NAME NEIGHBORS_ANN_CAGRA_FILTER_FP8_SCAN_TEST
+  PATH neighbors/ann_cagra/test_filter_fp8_scan.cu
+  GPUS 1
+  PERCENT 100
+)
+
+ConfigureTest(
   NAME NEIGHBORS_ANN_CAGRA_HELPERS_TEST
   PATH neighbors/ann_cagra/test_optimize_uint32_t.cu neighbors/ann_cagra/test_batch_load_iterator.cu
        neighbors/ann_cagra/test_serialize_dataset_layouts.cu
@@ -498,6 +505,7 @@ ConfigureTest(
        preprocessing/spectral_embedding.cu
        preprocessing/product_quantization.cu
        preprocessing/pca.cu
+       preprocessing/fp8_quantization.cu
   GPUS 1
   PERCENT 100
 )

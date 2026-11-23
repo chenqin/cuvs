@@ -10,12 +10,14 @@
 #include "detail/cagra/cagra_build.cuh"
 #include "detail/cagra/cagra_merge.cuh"
 #include "detail/cagra/cagra_search.cuh"
+#include "detail/cagra/fp8_scan.hpp"
 #include "detail/cagra/graph_core.cuh"
 
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/host_device_accessor.hpp>
 #include <raft/core/logger.hpp>
 #include <raft/core/mdspan.hpp>
+#include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/linalg/norm.cuh>
 #include <raft/linalg/reduce.cuh>
@@ -27,6 +29,7 @@
 #include <cuvs/neighbors/common.hpp>
 
 #include <algorithm>
+#include <new>
 #include <optional>
 #include <type_traits>
 
@@ -423,6 +426,16 @@ void search_with_filtering(raft::resources const& res,
 }
 
 /**
+ * Share of `total_rows` that a filter keeping `kept_rows` of them removes, clamped to [0, 0.999] so
+ * the plan's itopk scaling stays finite.
+ */
+inline float removed_share(int64_t total_rows, int64_t kept_rows)
+{
+  const float rate = static_cast<float>(total_rows - kept_rows) / static_cast<float>(total_rows);
+  return std::min(std::max(rate, 0.0f), 0.999f);
+}
+
+/**
  * Fraction of rows removed by per-partition bitsets (one bitset per partition; an empty view means
  * the partition is unfiltered), clamped to [0, 0.999] so the plan's itopk scaling stays finite.
  */
@@ -440,8 +453,7 @@ inline float bitset_filtering_rate(
     kept_rows +=
       filtered ? static_cast<int64_t>(partition_bitsets[i].count(res)) : partition_rows[i];
   }
-  const float rate = static_cast<float>(total_rows - kept_rows) / static_cast<float>(total_rows);
-  return std::min(std::max(rate, 0.0f), 0.999f);
+  return removed_share(total_rows, kept_rows);
 }
 
 /**
@@ -463,6 +475,207 @@ inline void resolve_filtered_search_algo(search_params& params)
   }
 }
 
+/**
+ * An index with rows and no graph (a dataset and an empty graph, e.g. one constructed from a
+ * metric and then given a dataset): only the FP8 filtered scan can search it. Disk-backed indexes
+ * do not count, as their search fails for that reason first.
+ */
+template <typename T, typename IdxT, cuvs::neighbors::ann_dataset_view DatasetViewT>
+[[nodiscard]] auto is_graph_free(const index<T, IdxT, DatasetViewT>& idx) -> bool
+{
+  return idx.size() > 0 && idx.graph().extent(0) == 0 && !idx.graph_fd().has_value() &&
+         !idx.dataset_fd().has_value();
+}
+
+/** What `resolve_filtered_route` chose for one search. */
+struct filtered_route_choice {
+  /** Whether the FP8 filtered scan runs the search, rather than the graph walk. */
+  bool scan = false;
+  /** The set bits of the bitset filter when the choice counted them, else -1. */
+  int64_t bitset_count = -1;
+};
+
+/**
+ * Whether the FP8 filtered scan runs a search (`search_params::filtered_route`). The conditions are
+ * checked in this order: GRAPH and an index without scan codes return before any CUDA call or
+ * bitset work; then the conditions the host can check; then whether this build holds scan kernels
+ * for the device; last, for AUTO, the share of rows the filter passes, which counts the bits of a
+ * bitset on the device when `filtering_rate` is not given. When a condition fails AUTO walks the
+ * graph, while SCAN fails naming it, as AUTO does on an index with codes and no graph.
+ */
+template <typename T, typename IdxT, cuvs::neighbors::ann_dataset_view DatasetViewT>
+auto resolve_filtered_route(raft::resources const& res,
+                            const search_params& params,
+                            const index<T, IdxT, DatasetViewT>& idx,
+                            const cuvs::neighbors::filtering::base_filter& sample_filter,
+                            int64_t k) -> filtered_route_choice
+{
+  using route_mode   = filtered_route_mode;
+  const auto route   = params.filtered_route;
+  const auto walk    = filtered_route_choice{};
+  const bool is_scan = route == route_mode::SCAN;
+  RAFT_EXPECTS(route == route_mode::GRAPH || is_scan || route == route_mode::AUTO,
+               "CAGRA search: unknown filtered_route %d",
+               static_cast<int>(route));
+  if (route == route_mode::GRAPH) { return walk; }
+  if (!idx.scan_codes().has_value()) {
+    RAFT_EXPECTS(!is_scan,
+                 "CAGRA filtered_route SCAN: the index has no scan codes; attach them with "
+                 "update_scan_codes");
+    return walk;
+  }
+  // Without a graph to walk instead, AUTO fails where SCAN does, and says why it cannot walk.
+  const bool forced          = is_scan || is_graph_free(idx);
+  const char* const no_graph = is_scan ? "" : "; the index has no graph to walk instead";
+  if constexpr (!std::is_same_v<T, half> ||
+                !cuvs::neighbors::is_dense_row_major_device_dataset_view_v<DatasetViewT>) {
+    // Not reached in practice: update_scan_codes refuses these indexes.
+    RAFT_EXPECTS(
+      !forced, "CAGRA filtered scan: takes FP16 indexes with dense device rows%s", no_graph);
+    return walk;
+  } else {
+    namespace filtering = cuvs::neighbors::filtering;
+    const auto* bitset =
+      dynamic_cast<const filtering::bitset_filter<uint32_t, int64_t>*>(&sample_filter);
+    const auto* row_list = dynamic_cast<const filtering::row_list_filter*>(&sample_filter);
+    const bool unfiltered =
+      dynamic_cast<const filtering::none_sample_filter*>(&sample_filter) != nullptr;
+    if (bitset == nullptr && row_list == nullptr && !unfiltered) {
+      RAFT_EXPECTS(!forced,
+                   "CAGRA filtered scan: takes a bitset_filter, a row_list_filter or no filter%s",
+                   no_graph);
+      return walk;
+    }
+    // Without a filter AUTO scans only an index without a graph.
+    if (unfiltered && !forced) { return walk; }
+    const auto rows  = static_cast<int64_t>(idx.size());
+    const auto codes = *idx.scan_codes();
+    if (codes.n_rows() != rows || idx.dataset().n_rows() != rows || rows >= (int64_t{1} << 32)) {
+      RAFT_EXPECTS(!forced,
+                   "CAGRA filtered scan: scan codes of %ld rows for an index of %ld rows%s",
+                   static_cast<long>(codes.n_rows()),
+                   static_cast<long>(rows),
+                   no_graph);
+      return walk;
+    }
+    const auto metric = idx.metric();
+    if (metric != cuvs::distance::DistanceType::L2Expanded &&
+        metric != cuvs::distance::DistanceType::L2Unexpanded) {
+      RAFT_EXPECTS(!forced,
+                   "CAGRA filtered scan: takes the L2Expanded and L2Unexpanded metrics (metric "
+                   "%d)%s",
+                   static_cast<int>(metric),
+                   no_graph);
+      return walk;
+    }
+    if (idx.dim() < 1 || idx.dim() > detail::fp8_scan::max_dims) {
+      RAFT_EXPECTS(!forced,
+                   "CAGRA filtered scan: takes 1 to %u dimensions (the index has %u)%s",
+                   detail::fp8_scan::max_dims,
+                   idx.dim(),
+                   no_graph);
+      return walk;
+    }
+    if (k < 1 || k > detail::fp8_scan::max_k) {
+      RAFT_EXPECTS(!forced,
+                   "CAGRA filtered scan: takes k from 1 to %ld (k is %ld)%s",
+                   static_cast<long>(detail::fp8_scan::max_k),
+                   static_cast<long>(k),
+                   no_graph);
+      return walk;
+    }
+    if (params.query_bitsets != nullptr) {
+      RAFT_EXPECTS(
+        !forced, "CAGRA filtered scan: does not take search_params::query_bitsets%s", no_graph);
+      return walk;
+    }
+    if (idx.source_indices().has_value()) {
+      RAFT_EXPECTS(
+        !forced, "CAGRA filtered scan: does not take indexes with source indices%s", no_graph);
+      return walk;
+    }
+    if (bitset != nullptr && bitset->bitset_view_.size() < rows) {
+      RAFT_EXPECTS(!forced,
+                   "CAGRA filtered scan: a bitset of %ld rows for an index of %ld rows%s",
+                   static_cast<long>(bitset->bitset_view_.size()),
+                   static_cast<long>(rows),
+                   no_graph);
+      return walk;
+    }
+    if (row_list != nullptr && row_list->rows.extent(0) > rows) {
+      RAFT_EXPECTS(!forced,
+                   "CAGRA filtered scan: a row_list_filter of %ld rows for an index of %ld rows%s",
+                   static_cast<long>(row_list->rows.extent(0)),
+                   static_cast<long>(rows),
+                   no_graph);
+      return walk;
+    }
+    if (!detail::fp8_scan::is_supported(res)) {
+      RAFT_EXPECTS(!forced,
+                   "CAGRA filtered scan: this build holds no scan kernels for the device (they "
+                   "need a kernel image for sm_89 or newer)%s",
+                   no_graph);
+      return walk;
+    }
+    if (forced) { return filtered_route_choice{true, -1}; }
+    // AUTO over an index with a graph: scan when few enough rows pass. filtering_rate is the share
+    // filtered out, the opposite of the pass share.
+    if (rows == 0) { return walk; }
+    int64_t bitset_count = -1;
+    double pass_share    = 0.0;
+    if (row_list != nullptr) {
+      pass_share = static_cast<double>(row_list->rows.extent(0)) / static_cast<double>(rows);
+    } else if (params.filtering_rate > 0.0f) {
+      pass_share = 1.0 - static_cast<double>(params.filtering_rate);
+    } else {
+      bitset_count = static_cast<int64_t>(bitset->bitset_view_.count(res));
+      pass_share   = static_cast<double>(bitset_count) / static_cast<double>(rows);
+    }
+    return filtered_route_choice{pass_share <= static_cast<double>(params.scan_max_pass_rate),
+                                 bitset_count};
+  }
+}
+
+/**
+ * Graph search with a bitset filter. `passing_rows` is the number of rows the bitset passes when
+ * the caller knows it (the route's count, or the length of a row list), else -1; it then stands
+ * for the filtering rate, which is otherwise counted here (not under PASSING_TWO_HOP, which uses
+ * none).
+ */
+template <typename T,
+          typename IdxT,
+          cuvs::neighbors::ann_dataset_view DatasetViewT,
+          typename OutputIdxT>
+void search_with_bitset(
+  raft::resources const& res,
+  const search_params& params,
+  const index<T, IdxT, DatasetViewT>& idx,
+  raft::device_matrix_view<const T, int64_t, raft::row_major> queries,
+  raft::device_matrix_view<OutputIdxT, int64_t, raft::row_major> neighbors,
+  raft::device_matrix_view<float, int64_t, raft::row_major> distances,
+  const cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>& sample_filter,
+  int64_t passing_rows)
+{
+  search_params params_copy = params;
+  resolve_filtered_search_algo(params_copy);
+  if (params.filtering_rate < 0.0) {
+    if (params.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
+      // The rate only lengthens the SCORE_ALL candidate list: do not count the bitset for it.
+      params_copy.filtering_rate = 0.0;
+    } else {
+      RAFT_EXPECTS(params.query_bitsets == nullptr,
+                   "search_params::filtering_rate must be given with query_bitsets");
+      const auto n_rows = static_cast<int64_t>(idx.dataset().n_rows());
+      params_copy.filtering_rate =
+        passing_rows >= 0 ? removed_share(n_rows, passing_rows)
+                          : bitset_filtering_rate(res, {n_rows}, {sample_filter.bitset_view_});
+    }
+  }
+  auto sample_filter_copy = sample_filter;
+  return search_with_filtering<T, IdxT, decltype(sample_filter_copy), OutputIdxT, DatasetViewT>(
+    res, params_copy, idx, queries, neighbors, distances, sample_filter_copy);
+}
+
 template <typename T,
           typename IdxT,
           cuvs::neighbors::ann_dataset_view DatasetViewT,
@@ -475,6 +688,68 @@ void search(raft::resources const& res,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances,
             const cuvs::neighbors::filtering::base_filter& sample_filter_ref)
 {
+  const auto route =
+    resolve_filtered_route(res, params, idx, sample_filter_ref, neighbors.extent(1));
+  if constexpr (std::is_same_v<T, half> &&
+                cuvs::neighbors::is_dense_row_major_device_dataset_view_v<DatasetViewT>) {
+    if (route.scan) {
+      RAFT_EXPECTS(
+        queries.extent(0) == neighbors.extent(0) && queries.extent(0) == distances.extent(0),
+        "Number of rows in output neighbors and distances matrices must equal the number of "
+        "queries.");
+      RAFT_EXPECTS(neighbors.extent(1) == distances.extent(1),
+                   "Number of columns in output neighbors and distances matrices must equal k");
+      RAFT_EXPECTS(queries.extent(1) == idx.dim(),
+                   "Number of query dimensions should equal number of dimensions in the index.");
+      const auto data = idx.dataset().data_const_view();
+      const detail::fp8_scan::rerank_rows dataset_rows{
+        data.data_handle(), data.extent(0), static_cast<uint32_t>(data.extent(1)), data.stride(0)};
+      const auto codes = *idx.scan_codes();
+      auto scan        = [&](const uint32_t* rows, int64_t n_rows) {
+        detail::fp8_scan::search<OutputIdxT>(res,
+                                             params,
+                                             codes,
+                                             dataset_rows,
+                                             queries,
+                                             rows,
+                                             static_cast<uint32_t>(n_rows),
+                                             neighbors,
+                                             distances);
+      };
+      const auto n_rows = static_cast<int64_t>(idx.size());
+      try {
+        if (const auto* row_list = dynamic_cast<const cuvs::neighbors::filtering::row_list_filter*>(
+              &sample_filter_ref)) {
+          scan(row_list->rows.data_handle(), row_list->rows.extent(0));
+        } else if (const auto* bitset = dynamic_cast<
+                     const cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>*>(
+                     &sample_filter_ref)) {
+          const auto rows = detail::fp8_scan::bitset_rows(res, bitset->bitset_view_.data(), n_rows);
+          scan(rows.data(), static_cast<int64_t>(rows.size()));
+        } else {
+          const auto rows = detail::fp8_scan::all_rows(res, n_rows);
+          scan(rows.data(), static_cast<int64_t>(rows.size()));
+        }
+        return;
+      } catch (const std::bad_alloc&) {
+        // Too little memory for the scan: AUTO walks the graph instead, which writes every output
+        // (and clears the retry flags) again. SCAN, and an index without a graph, cannot.
+        if (params.filtered_route != filtered_route_mode::AUTO || is_graph_free(idx)) { throw; }
+        RAFT_LOG_DEBUG("CAGRA filtered scan: out of memory; walking the graph instead");
+      }
+    }
+  }
+  RAFT_EXPECTS(!is_graph_free(idx),
+               "CAGRA search: the index has no graph, so only the FP8 filtered scan can search "
+               "it: attach scan codes with update_scan_codes, and set filtered_route to AUTO or "
+               "SCAN");
+  // The graph's results need no second search.
+  if (params.scan_retry != nullptr && queries.extent(0) > 0) {
+    RAFT_CUDA_TRY(cudaMemsetAsync(params.scan_retry,
+                                  0,
+                                  static_cast<size_t>(queries.extent(0)) * sizeof(uint32_t),
+                                  raft::resource::get_cuda_stream(res).get()));
+  }
   try {
     using none_filter_type    = cuvs::neighbors::filtering::none_sample_filter;
     auto& sample_filter       = dynamic_cast<const none_filter_type&>(sample_filter_ref);
@@ -492,22 +767,33 @@ void search(raft::resources const& res,
     auto& sample_filter =
       dynamic_cast<const cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>&>(
         sample_filter_ref);
-    search_params params_copy = params;
-    resolve_filtered_search_algo(params_copy);
-    if (params.filtering_rate < 0.0) {
-      if (params.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
-        // The rate only lengthens the SCORE_ALL candidate list: do not count the bitset for it.
-        params_copy.filtering_rate = 0.0;
-      } else {
-        RAFT_EXPECTS(params.query_bitsets == nullptr,
-                     "search_params::filtering_rate must be given with query_bitsets");
-        params_copy.filtering_rate = bitset_filtering_rate(
-          res, {static_cast<int64_t>(idx.dataset().n_rows())}, {sample_filter.bitset_view_});
-      }
-    }
-    auto sample_filter_copy = sample_filter;
-    return search_with_filtering<T, IdxT, decltype(sample_filter_copy), OutputIdxT, DatasetViewT>(
-      res, params_copy, idx, queries, neighbors, distances, sample_filter_copy);
+    // A count the route took when AUTO declined the scan stands for the filtering rate.
+    return search_with_bitset<T, IdxT, DatasetViewT, OutputIdxT>(
+      res, params, idx, queries, neighbors, distances, sample_filter, route.bitset_count);
+  } catch (const std::bad_cast&) {
+  }
+
+  try {
+    auto& row_list =
+      dynamic_cast<const cuvs::neighbors::filtering::row_list_filter&>(sample_filter_ref);
+    // The graph walk reads a bitset: one over the index's rows with the listed rows set, searched
+    // as a bitset filter whose count is the list's length.
+    const auto n_rows = static_cast<int64_t>(idx.size());
+    const auto listed = row_list.rows.extent(0);
+    RAFT_EXPECTS(listed <= n_rows && n_rows < (int64_t{1} << 32),
+                 "row_list_filter: %ld rows for an index of %ld rows",
+                 static_cast<long>(listed),
+                 static_cast<long>(n_rows));
+    cuvs::core::bitset<uint32_t, uint32_t> passing(
+      res,
+      raft::make_device_vector_view<const uint32_t, uint32_t>(row_list.rows.data_handle(),
+                                                              static_cast<uint32_t>(listed)),
+      static_cast<uint32_t>(n_rows),
+      false);
+    const cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t> sample_filter(
+      cuvs::core::bitset_view<uint32_t, int64_t>(passing.view().data(), n_rows));
+    return search_with_bitset<T, IdxT, DatasetViewT, OutputIdxT>(
+      res, params, idx, queries, neighbors, distances, sample_filter, listed);
   } catch (const std::bad_cast&) {
   }
 
@@ -678,12 +964,14 @@ auto update_dataset(raft::resources const& res,
                     DstDatasetViewT dataset) -> index<T, IdxT, DstDatasetViewT>
 {
   auto const graph_rows = static_cast<int64_t>(cagra_index.graph_size());
-  if (dataset.n_rows() != graph_rows) {
+  // An index without a graph (searched by the FP8 filtered scan only) has no rows to match, and
+  // one without a dataset no dimension.
+  if (graph_rows > 0 && dataset.n_rows() != graph_rows) {
     RAFT_LOG_WARN("The new dataset row count (%ld) does not match the graph row count (%ld)",
                   static_cast<long>(dataset.n_rows()),
                   static_cast<long>(graph_rows));
   }
-  if (dataset.dim() != cagra_index.dim()) {
+  if (cagra_index.dim() > 0 && dataset.dim() != cagra_index.dim()) {
     RAFT_LOG_WARN("The new dataset dimension (%u) does not match the index dimension (%u)",
                   static_cast<unsigned>(dataset.dim()),
                   static_cast<unsigned>(cagra_index.dim()));

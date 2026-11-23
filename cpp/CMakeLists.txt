@@ -1498,6 +1498,7 @@ if(NOT BUILD_CPU_ONLY)
     ${cagra_extend_inst_files}
     src/neighbors/cagra_optimize.cu
     src/neighbors/detail/cagra/graph_shared.cu
+    src/neighbors/detail/cagra/fp8_scan.cu
     src/neighbors/detail/cagra/cagra_merge_scaffold_shared.cu
     ${cagra_serialize_inst_files}
     ${cagra_merge_inst_files}
@@ -1565,6 +1566,7 @@ if(NOT BUILD_CPU_ONLY)
     src/preprocessing/quantize/binary.cu
     src/preprocessing/quantize/pq.cu
     src/preprocessing/quantize/bbq.cu
+    src/preprocessing/quantize/fp8.cu
     src/preprocessing/spectral/spectral_embedding.cu
     src/preprocessing/pca/pca.cu
     ${select_k_inst_files}

@@ -790,7 +790,7 @@ void brute_force_search_filtered(
     n_pass = actual_filter->view().count(res);
     nnz_h  = n_queries * (*n_pass);
   } else {
-    RAFT_FAIL("Unsupported sample filter type");
+    RAFT_FAIL("Unsupported sample filter type: %d", static_cast<int>(filter_type));
   }
 
   std::visit([&](const auto& actual_view) { filter_data = actual_view.data(); }, *filter_view);
@@ -937,7 +937,8 @@ void search(raft::resources const& res,
       return brute_force_search_filtered<T, int64_t, uint32_t, DistT>(
         res, idx, queries, &sample_filter, neighbors, distances);
     } catch (const std::bad_cast&) {
-      RAFT_FAIL("Unsupported sample filter type");
+      RAFT_FAIL("Unsupported sample filter type: %d",
+                static_cast<int>(sample_filter_ref.get_filter_type()));
     }
   }
 }
