@@ -186,9 +186,6 @@ struct index_state {
     RAFT_EXPECTS(sample_filter.get_filter_type() != cuvs::neighbors::filtering::FilterType::Roaring,
                  "tiered_index::search does not support roaring_bitmap_filter; use direct "
                  "cagra::search instead.");
-    RAFT_EXPECTS(sample_filter.get_filter_type() != cuvs::neighbors::filtering::FilterType::RowList,
-                 "tiered_index::search does not support row_list_filter; use direct "
-                 "cagra::search instead.");
 
     // if we only have ANN vectors, search those and return immendiately
     if (bfknn_rows() == 0) {

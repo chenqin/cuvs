@@ -227,7 +227,7 @@ void _search(cuvsResources_t res,
                          distances_mds,
                          bitset_filter_obj);
   } else {
-    RAFT_FAIL("Unsupported filter type: %d", (int)filter.type);
+    RAFT_FAIL("Unsupported filter type: BITMAP");
   }
 }
 

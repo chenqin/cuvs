@@ -9,7 +9,6 @@
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/neighbors/brute_force.hpp>
 
-#include <raft/core/error.hpp>
 #include <raft/core/host_mdspan.hpp>
 #include <raft/linalg/unary_op.cuh>
 #include <raft/matrix/copy.cuh>
@@ -1060,35 +1059,5 @@ INSTANTIATE_TEST_CASE_P(PrefilteredBruteForceOnBitsetTest,
 INSTANTIATE_TEST_CASE_P(PrefilteredBruteForceOnBitsetTest,
                         PrefilteredBruteForceTestOnBitset_half_int64,
                         ::testing::ValuesIn(selectk_inputs<int64_t>));
-
-// Only CAGRA reads a row list: brute force must reject it, not search every row.
-TEST(PrefilteredBruteForce, RejectsRowListFilter)
-{
-  raft::resources res;
-  constexpr int64_t n_rows = 64, n_queries = 2, dim = 8, k = 4;
-  auto stream    = raft::resource::get_cuda_stream(res).get();
-  auto dataset   = raft::make_device_matrix<float, int64_t>(res, n_rows, dim);
-  auto queries   = raft::make_device_matrix<float, int64_t>(res, n_queries, dim);
-  auto neighbors = raft::make_device_matrix<int64_t, int64_t>(res, n_queries, k);
-  auto distances = raft::make_device_matrix<float, int64_t>(res, n_queries, k);
-  auto rows      = raft::make_device_vector<uint32_t, int64_t>(res, 2);
-  RAFT_CUDA_TRY(cudaMemsetAsync(dataset.data_handle(), 0, dataset.size() * sizeof(float), stream));
-  RAFT_CUDA_TRY(cudaMemsetAsync(queries.data_handle(), 0, queries.size() * sizeof(float), stream));
-  const std::vector<uint32_t> listed{3, 7};
-  raft::update_device(rows.data_handle(), listed.data(), listed.size(), stream);
-
-  auto index =
-    brute_force::build(res, brute_force::index_params{}, raft::make_const_mdspan(dataset.view()));
-  const cuvs::neighbors::filtering::row_list_filter filter(raft::make_const_mdspan(rows.view()));
-  EXPECT_THROW(brute_force::search(res,
-                                   brute_force::search_params{},
-                                   index,
-                                   raft::make_const_mdspan(queries.view()),
-                                   neighbors.view(),
-                                   distances.view(),
-                                   filter),
-               raft::logic_error);
-  raft::resource::sync_stream(res);
-}
 
 }  // namespace cuvs::neighbors::brute_force

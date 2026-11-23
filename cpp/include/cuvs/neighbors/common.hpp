@@ -943,15 +943,7 @@ namespace filtering {
  * @{
  */
 
-enum class FilterType : int {
-  None    = 0,
-  Bitmap  = 1,
-  Bitset  = 2,
-  Bloom   = 3,
-  Roaring = 4,
-  RowList = 5,
-  UDF     = 100
-};
+enum class FilterType : int { None = 0, Bitmap = 1, Bitset = 2, Bloom = 3, Roaring = 4, UDF = 100 };
 
 struct base_filter {
   ~base_filter()                             = default;
@@ -1233,25 +1225,6 @@ struct udf_filter : public base_filter {
   }
 
   FilterType get_filter_type() const override { return FilterType::UDF; }
-};
-
-/**
- * @brief Filter an index with the list of its rows that pass
- *
- * Passes exactly the listed rows: unique row numbers of the searched index, each below its size.
- * The search reads the list as a whole rather than testing each candidate against it.
- *
- * This filter holds a non-owning view of a device array; the array must stay valid until every
- * search that uses the filter has finished. Direct CAGRA search accepts it; every other algorithm
- * rejects it.
- */
-struct row_list_filter : public base_filter {
-  /** Row numbers of the passing rows, on the device. */
-  raft::device_vector_view<const uint32_t, int64_t> rows;
-
-  explicit row_list_filter(raft::device_vector_view<const uint32_t, int64_t> rows) : rows(rows) {}
-
-  [[nodiscard]] auto get_filter_type() const -> FilterType override { return FilterType::RowList; }
 };
 
 /** @} */  // end group neighbors_filtering

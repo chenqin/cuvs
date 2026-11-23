@@ -326,8 +326,7 @@ inline void search(raft::resources const& handle,
         sample_filter_ref);
     return search_with_filtering(handle, params, idx, queries, neighbors, distances, sample_filter);
   } catch (const std::bad_cast&) {
-    RAFT_FAIL("Unsupported sample filter type: %d",
-              static_cast<int>(sample_filter_ref.get_filter_type()));
+    RAFT_FAIL("Unsupported sample filter type");
   }
 }
 

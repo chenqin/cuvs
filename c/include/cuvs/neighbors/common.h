@@ -28,10 +28,7 @@ enum cuvsFilterType {
   /* Filter an index with a bitset */
   BITSET = 1,
   /* Filter an index with a bitmap */
-  BITMAP = 2,
-  /* Pass exactly the listed rows: `addr` is a DLManagedTensor* of a 1-D uint32 device array of
-   * unique row numbers of the searched index, each below its size. CAGRA search only. */
-  ROW_LIST = 3
+  BITMAP = 2
 };
 
 /**
