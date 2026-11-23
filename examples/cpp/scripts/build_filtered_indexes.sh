@@ -9,15 +9,16 @@
 #
 #   build_filtered_indexes.sh DATA_DIR OUT_DIR [EXAMPLE_BINARY]
 #
-# DATA_DIR/NAME.fbin (uint32 rows, uint32 dimension, float32 rows) becomes OUT_DIR/NAME/graph.cagra
-# (FP16 rows and graph, for the two-hop walk). A build of 46.5 million 65-dimension rows takes about
-# two minutes on a B200. NGPUS overrides the number of GPUs used; a file whose OUT_DIR/NAME/graph.cagra
-# exists is skipped, so the script can be run again after a failure.
+# DATA_DIR/NAME.fbin (uint32 rows, uint32 dimension, float32 rows) becomes OUT_DIR/NAME/ with
+# graph.cagra (FP16 rows and graph, for the two-hop walk) and rows.f16 (the rows alone, which the
+# search step takes its queries and exact answers from). A build of 46.5 million 65-dimension rows
+# takes about two minutes on a B200. NGPUS overrides the number of GPUs used; a file whose
+# OUT_DIR/NAME/rows.f16 exists is skipped, so the script can be run again after a failure.
 
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  sed -n '6,15p' "$0"
+  sed -n '6,16p' "$0"
   exit 2
 fi
 DATA_DIR=$1
@@ -34,13 +35,13 @@ mkdir -p "$OUT_DIR"
 one() {
   local fbin=$1 gpu=$2 name
   name=$(basename "$fbin" .fbin)
-  [[ -f "$OUT_DIR/$name/graph.cagra" ]] && return 0
+  [[ -f "$OUT_DIR/$name/rows.f16" ]] && return 0
   mkdir -p "$OUT_DIR/$name"
   if CUDA_VISIBLE_DEVICES=$gpu "$EXAMPLE" build "$fbin" "$OUT_DIR/$name" > "$OUT_DIR/$name/build.log" 2>&1; then
     echo "$name: built on GPU $gpu"
   else
     echo "$name: FAILED, see $OUT_DIR/$name/build.log"
-    rm -f "$OUT_DIR/$name/graph.cagra"
+    rm -f "$OUT_DIR/$name/rows.f16"
   fi
 }
 
@@ -53,7 +54,7 @@ done
 wait
 
 for dir in "$OUT_DIR"/*/; do
-  [[ -f "$dir/graph.cagra" ]] || continue
+  [[ -f "$dir/rows.f16" ]] || continue
   echo "== $(basename "$dir")"
   "$EXAMPLE" search "$dir" | tee "$dir/search.log"
 done
