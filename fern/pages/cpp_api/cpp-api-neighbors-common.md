@@ -184,7 +184,6 @@ enum class FilterType : int {
   Bitset = 2,
   Bloom = 3,
   Roaring = 4,
-  RowList = 5,
   UDF = 100
 };
 ```
@@ -198,7 +197,6 @@ enum class FilterType : int {
 | `Bitset` | `2` |
 | `Bloom` | `3` |
 | `Roaring` | `4` |
-| `RowList` | `5` |
 | `UDF` | `100` |
 
 <a id="neighbors-filtering-none-sample-filter-operator"></a>
@@ -527,27 +525,6 @@ struct udf_filter : public base_filter {
 | `filter_data` | `void*` | Opaque device-accessible pointer passed to the predicate. |
 | `filtering_rate` | `float` | Estimated fraction of rows rejected by the predicate, or negative if unknown. |
 | `function_name` | `std::string` | Device function name to call from the generated CAGRA sample filter. |
-
-<a id="neighbors-filtering-row-list-filter"></a>
-### neighbors::filtering::row_list_filter
-
-Filter an index with the list of its rows that pass
-
-Passes exactly the listed rows: unique row numbers of the searched index, each below its size. The search reads the list as a whole rather than testing each candidate against it.
-
-This filter holds a non-owning view of a device array; the array must stay valid until every search that uses the filter has finished. Direct CAGRA search accepts it; every other algorithm rejects it.
-
-```cpp
-struct row_list_filter : public base_filter {
-  raft::device_vector_view<const uint32_t, int64_t> rows;
-};
-```
-
-**Fields**
-
-| Name | Type | Description |
-| --- | --- | --- |
-| `rows` | `raft::device_vector_view<const uint32_t, int64_t>` | Row numbers of the passing rows, on the device. |
 
 ## ANN MG index build parameters
 
