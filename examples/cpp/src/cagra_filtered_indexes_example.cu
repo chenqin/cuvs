@@ -14,7 +14,8 @@
 //   CAGRA_FILTERED_INDEXES_EXAMPLE search OUT            load it and search at 1% and 10% filters
 //
 // DATA.fbin is the benchmark format: uint32 rows, uint32 dimension, then float32 rows. OUT receives
-// graph.cagra (FP16 rows and graph).
+// graph.cagra (FP16 rows and graph) and rows.f16 (the FP16 rows alone, for queries and exact
+// answers).
 
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>
@@ -22,7 +23,6 @@
 #include <raft/core/copy.cuh>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
-#include <raft/core/error.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/random/rng.cuh>
@@ -119,7 +119,40 @@ auto make_padded_rows(raft::device_resources const& res,
   return {std::move(owner), view};
 }
 
-/** Build the graph index and write it, with its rows, to graph.cagra. */
+template <typename T>
+void write_array(std::ofstream& out, T const* data, size_t n)
+{
+  out.write(reinterpret_cast<char const*>(data), n * sizeof(T));
+}
+
+template <typename T>
+void read_array(std::ifstream& in, T* data, size_t n)
+{
+  in.read(reinterpret_cast<char*>(data), n * sizeof(T));
+}
+
+/** rows.f16: int64 rows, int64 dimension, then the FP16 rows, densely. */
+void save_rows(std::string const& path, host_rows const& rows)
+{
+  std::ofstream out(path, std::ios::binary);
+  int64_t header[2] = {rows.n_rows, rows.dim};
+  write_array(out, header, 2);
+  write_array(out, rows.data.data(), rows.data.size());
+}
+
+auto load_rows(std::string const& path) -> host_rows
+{
+  std::ifstream in(path, std::ios::binary);
+  if (!in) { throw std::runtime_error("cannot open " + path); }
+  int64_t header[2];
+  read_array(in, header, 2);
+  host_rows rows{
+    header[0], header[1], std::vector<half>(static_cast<size_t>(header[0]) * header[1])};
+  read_array(in, rows.data.data(), rows.data.size());
+  return rows;
+}
+
+/** Build the graph index and write graph.cagra (FP16 rows and graph) and rows.f16 (the rows). */
 void build(raft::device_resources const& res, host_rows const& rows, std::string const& out_dir)
 {
   auto started = std::chrono::steady_clock::now();
@@ -134,6 +167,7 @@ void build(raft::device_resources const& res, host_rows const& rows, std::string
   auto padded                      = make_padded_rows(res, raft::make_const_mdspan(dataset.view()));
   auto index                       = cagra::build(res, params, padded.view);
   cagra::serialize(res, out_dir + "/graph.cagra", index, /*include_dataset=*/true);
+  save_rows(out_dir + "/rows.f16", rows);
 
   std::chrono::duration<double> took = std::chrono::steady_clock::now() - started;
   std::cout << "built " << rows.n_rows << " rows of " << rows.dim << " dimensions into " << out_dir
@@ -187,32 +221,21 @@ double recall(std::vector<uint32_t> const& found, std::vector<int64_t> const& tr
 /** Load the index from out_dir and search it with a 1% and a 10% filter. */
 void search(raft::device_resources const& res, std::string const& out_dir)
 {
-  // The graph index and its FP16 rows, from the same file.
+  // The graph index, with its FP16 rows, from graph.cagra.
   cagra::index<half, uint32_t> graph(res);
   std::unique_ptr<cuvs::neighbors::device_padded_dataset<half, int64_t>> graph_rows;
   cagra::deserialize(res, out_dir + "/graph.cagra", &graph, &graph_rows);
-  auto const n_rows = static_cast<int64_t>(graph.size());
-  auto const dim    = static_cast<int64_t>(graph.dim());
 
-  // The rows, dense, for the queries and the exact answers.
-  auto padded   = graph.dataset().data_const_view();
-  auto rows_dev = raft::make_device_matrix<half, int64_t>(res, n_rows, dim);
-  RAFT_CUDA_TRY(cudaMemcpy2DAsync(rows_dev.data_handle(),
-                                  dim * sizeof(half),
-                                  padded.data_handle(),
-                                  padded.stride(0) * sizeof(half),
-                                  dim * sizeof(half),
-                                  n_rows,
-                                  cudaMemcpyDeviceToDevice,
-                                  raft::resource::get_cuda_stream(res)));
+  // The same rows, dense, from rows.f16: the queries and the exact answers.
+  auto rows     = load_rows(out_dir + "/rows.f16");
+  auto rows_dev = to_device(res, rows);
+  auto n_rows   = rows.n_rows;
 
   // Queries: the first rows, so that every query has neighbours at every filter width. Their row
   // stride is the dimension, which keeps the search to one launch for all of them.
-  auto queries = raft::make_device_matrix<half, int64_t>(res, n_queries, dim);
-  raft::copy(queries.data_handle(),
-             rows_dev.data_handle(),
-             queries.size(),
-             raft::resource::get_cuda_stream(res));
+  auto queries = raft::make_device_matrix<half, int64_t>(res, n_queries, rows.dim);
+  raft::copy(
+    queries.data_handle(), rows.data.data(), queries.size(), raft::resource::get_cuda_stream(res));
 
   // Exact answers: brute force over the same FP16 rows.
   auto exact_index = cuvs::neighbors::brute_force::build(

@@ -1213,7 +1213,7 @@ The example `examples/cpp/src/cagra_filtered_indexes_example.cu` builds, saves, 
 ./CAGRA_FILTERED_INDEXES_EXAMPLE
 
 # from float32 rows (.fbin: uint32 rows, uint32 dimension, then the rows)
-./CAGRA_FILTERED_INDEXES_EXAMPLE build data.fbin out/   # graph.cagra, rows.f16, codes.fp8
+./CAGRA_FILTERED_INDEXES_EXAMPLE build data.fbin out/   # graph.cagra, rows.f16
 ./CAGRA_FILTERED_INDEXES_EXAMPLE search out/            # recall and time at a 1% and a 10% filter
 ```
 
