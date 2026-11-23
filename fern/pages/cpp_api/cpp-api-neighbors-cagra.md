@@ -50,6 +50,43 @@ enum class filter_expansion_mode {
 | `SCORE_ALL` | `0` |
 | `PASSING_TWO_HOP` | `1` |
 
+<a id="neighbors-cagra-filtered-route-mode"></a>
+### neighbors::cagra::filtered_route_mode
+
+How a search finds its candidates: by walking the graph, or by the FP8 filtered scan.
+
+The scan scores every row the filter passes from FP8 codes of the index's rows (`index::update_scan_codes`), for all the queries of the call at once, keeps `scan_candidates` of them per query, and re-scores those from the index's FP16 rows. Its work is one pass over the passing rows, shared by the queries of the call, so it suits filters that pass few rows, where a graph walk spends most of its work on rows it cannot return. The graph parameters are not used.
+
+The scan can run a search when all of these hold:
+
+- the index holds FP16 rows densely in device memory (a padded or standard device dataset) and has scan codes for every one of its rows;
+- the metric is L2Expanded or L2Unexpanded, the dimension is at most 512, and k is 1 to 4096;
+- the index has no source indices, and the search has no `query_bitsets`;
+- the filter is a `filtering::bitset_filter` over at least `size()` rows, a `filtering::row_list_filter`, or no filter (every row);
+- this build of cuVS holds scan kernels for the device (a kernel image for sm_89 or newer).
+
+A `filtering::row_list_filter` works on both routes: the scan reads the listed rows, and a search that walks the graph turns the list into a bitset of `size()` rows first.
+
+Results of the scan: neighbors are row numbers of the index, distances are squared L2, and slots past the rows that pass hold 0xFFFFFFFF (4294967295 in an int64 output) and the largest float distance. The graph search marks such slots with ids at or above size() too, but not always with the same value, so treat any id at or above size() as empty. The scan keeps its candidates by FP8 distance, so among candidates tied in FP8 distance at the cut, which are kept can change between identical calls, and with them the last results of a query.
+
+Searches of several indexes or batches never scan: multi-partition search, composite indexes of several children, tiered indexes, dynamic batching and multi-GPU search walk the graph, and they refuse SCAN, `scan_retry` and a `filtering::row_list_filter`.
+
+```cpp
+enum class filtered_route_mode {
+  GRAPH = 0,
+  SCAN = 1,
+  AUTO = 100
+};
+```
+
+**Values**
+
+| Name | Value |
+| --- | --- |
+| `GRAPH` | `0` |
+| `SCAN` | `1` |
+| `AUTO` | `100` |
+
 ## CAGRA index build parameters
 
 <a id="neighbors-vpq-params"></a>
@@ -391,6 +428,56 @@ Mapping from internal graph node indices to the original user-provided indices.
 **Returns**
 
 `std::optional<raft::device_vector_view<const index_type, int64_t>>`
+
+<a id="neighbors-cagra-index-scan-codes"></a>
+### neighbors::cagra::index::scan_codes
+
+FP8 codes of the rows for the filtered scan, when attached (`update_scan_codes`).
+
+```cpp
+[[nodiscard]] inline auto scan_codes() const noexcept
+-> std::optional<cuvs::preprocessing::quantize::fp8::quantizer_view>;
+```
+
+**Returns**
+
+[`std::optional<cuvs::preprocessing::quantize::fp8::quantizer_view>`](/api-reference/cpp-api-preprocessing-quantize-fp8#preprocessing-quantize-fp8-quantizer-view)
+
+<a id="neighbors-cagra-index-update-scan-codes"></a>
+### neighbors::cagra::index::update_scan_codes
+
+Attach FP8 codes of the index's rows for the filtered scan (`filtered_route_mode`).
+
+```cpp
+void update_scan_codes(raft::resources const& res,
+cuvs::preprocessing::quantize::fp8::quantizer_view codes);
+```
+
+The scan scores rows from these codes and re-scores its candidates from the index's FP16 rows. The index keeps the view, not a copy, as `update_graph` does with a device view: the caller keeps the codes and the row scales alive and unchanged while the index is searched. The codes are not serialized. A new dataset drops them: `extend`, `cagra::update_dataset`, the file descriptor `update_dataset`, `deserialize` and `merge` leave an index without codes, while moving the index keeps them.
+
+**Parameters**
+
+| Name | Direction | Type | Description |
+| --- | --- | --- | --- |
+| `res` | in | `raft::resources const&` | raft resources |
+| `codes` | in | [`cuvs::preprocessing::quantize::fp8::quantizer_view`](/api-reference/cpp-api-preprocessing-quantize-fp8#preprocessing-quantize-fp8-quantizer-view) | one row of codes and one scale for each row of the index, in the layout `cuvs::preprocessing::quantize::fp8::transform` writes: `codes.codes` [size(), width] with a width that is a multiple of 16 and at least `fp8::get_encoded_row_length(dim())`, 16-byte aligned; `codes.row_scales` [size()], 4-byte aligned; both on the device of the index. The index must hold FP16 rows densely in device memory, fewer than 2^32 of them. |
+
+**Returns**
+
+`void`
+
+<a id="neighbors-cagra-index-reset-scan-codes"></a>
+### neighbors::cagra::index::reset_scan_codes
+
+Detach the FP8 codes of `update_scan_codes`: the scan no longer applies to the index.
+
+```cpp
+void reset_scan_codes() noexcept;
+```
+
+**Returns**
+
+`void`
 
 <a id="neighbors-cagra-index-dataset-fd"></a>
 ### neighbors::cagra::index::dataset_fd
