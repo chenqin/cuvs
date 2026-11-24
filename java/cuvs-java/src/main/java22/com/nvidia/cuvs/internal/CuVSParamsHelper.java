@@ -49,6 +49,13 @@ public final class CuVSParamsHelper {
     cuvsCagraSearchParams.hashmap_max_fill_rate(seg, params.getHashMapMaxFillRate());
     cuvsCagraSearchParams.num_random_samplings(seg, params.getNumRandomSamplings());
     cuvsCagraSearchParams.rand_xor_mask(seg, params.getRandXORMask());
+    cuvsCagraSearchParams.filtering_rate(seg, params.getFilteringRate());
+    CagraSearchParams.FilterExpansion filterExpansion = params.getFilterExpansion();
+    cuvsCagraSearchParams.filter_expansion(
+        seg,
+        (filterExpansion != null ? filterExpansion : CagraSearchParams.FilterExpansion.SCORE_ALL)
+            .value);
+    cuvsCagraSearchParams.query_bitsets(seg, params.getQueryBitsets());
     return seg;
   }
 
