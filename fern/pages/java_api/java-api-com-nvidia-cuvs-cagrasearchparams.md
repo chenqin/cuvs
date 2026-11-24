@@ -23,7 +23,7 @@ SINGLE_CTA(0), /** * for small batch sizes */ MULTI_CTA(1), /** * MULTI_KERNEL *
 
 for large batch sizes
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:35`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:38`_
 
 ### MULTI_CTA
 
@@ -33,7 +33,7 @@ MULTI_CTA(1), /** * MULTI_KERNEL */ MULTI_KERNEL(2), /** * AUTO */ AUTO(100)
 
 for small batch sizes
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:39`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:42`_
 
 ### MULTI_KERNEL
 
@@ -43,7 +43,7 @@ MULTI_KERNEL(2), /** * AUTO */ AUTO(100)
 
 MULTI_KERNEL
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:43`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:46`_
 
 ### AUTO
 
@@ -53,7 +53,7 @@ AUTO(100)
 
 AUTO
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:47`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:50`_
 
 ### HASH
 
@@ -63,7 +63,7 @@ HASH(0), /** * SMALL */ SMALL(1), /** * AUTO_HASH */ AUTO_HASH(100)
 
 HASH
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:66`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:69`_
 
 ### SMALL
 
@@ -73,7 +73,7 @@ SMALL(1), /** * AUTO_HASH */ AUTO_HASH(100)
 
 SMALL
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:70`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:73`_
 
 ### AUTO_HASH
 
@@ -83,7 +83,41 @@ AUTO_HASH(100)
 
 AUTO_HASH
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:74`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:77`_
+
+### SCORE_ALL
+
+```java
+SCORE_ALL(0), /** * The distance is computed only for nodes that pass the filter, and only * these nodes enter the itopk list and are selected as parent nodes. The * child nodes of a parent node are its neighbors that pass the filter and, * for each neighbor that is filtered out (a bridge), the neighbors of the * bridge that pass the filter, up to the child capacity of the result * buffer (about the graph degree). The initial random seed nodes are random * nodes that pass the filter, each the nearest of up to as many such nodes * as the number of random samplings (see * {@link Builder#withNumRandomSamplings(int)}). The itopk size is not * increased according to the filtering rate, and the filtering rate of the * prefilter is not computed. */ PASSING_TWO_HOP(1)
+```
+
+The distance is computed for every neighbor of a parent node, whether or
+not it passes the filter, and a filtered-out node can be selected as a
+parent node. Filtered-out nodes are removed from the search results. The
+MULTI_CTA algorithm increases the itopk size according to the filtering
+rate to compensate for the filtered-out nodes in the itopk list.
+
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:116`_
+
+### PASSING_TWO_HOP
+
+```java
+PASSING_TWO_HOP(1)
+```
+
+The distance is computed only for nodes that pass the filter, and only
+these nodes enter the itopk list and are selected as parent nodes. The
+child nodes of a parent node are its neighbors that pass the filter and,
+for each neighbor that is filtered out (a bridge), the neighbors of the
+bridge that pass the filter, up to the child capacity of the result
+buffer (about the graph degree). The initial random seed nodes are random
+nodes that pass the filter, each the nearest of up to as many such nodes
+as the number of random samplings (see
+`Builder#withNumRandomSamplings(int)`). The itopk size is not
+increased according to the filtering rate, and the filtering rate of the
+prefilter is not computed.
+
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:130`_
 
 ### getMaxQueries
 
@@ -97,7 +131,7 @@ Gets the maximum number of queries to search at the same time (batch size).
 
 the maximum number of queries
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:143`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:210`_
 
 ### getITopKSize
 
@@ -111,7 +145,7 @@ Gets the number of intermediate search results retained during the search.
 
 the number of intermediate search results
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:152`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:219`_
 
 ### getMaxIterations
 
@@ -125,7 +159,7 @@ Gets the upper limit of search iterations.
 
 the upper limit value
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:161`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:228`_
 
 ### getTeamSize
 
@@ -139,7 +173,7 @@ Gets the number of threads used to calculate a single distance.
 
 the number of threads configured
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:170`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:237`_
 
 ### getSearchWidth
 
@@ -154,7 +188,7 @@ in each iteration.
 
 the number of graph nodes
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:180`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:247`_
 
 ### getMinIterations
 
@@ -168,7 +202,7 @@ Gets the lower limit of search iterations.
 
 the lower limit value
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:189`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:256`_
 
 ### getThreadBlockSize
 
@@ -182,7 +216,7 @@ Gets the thread block size.
 
 the thread block size
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:198`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:265`_
 
 ### getHashmapMinBitlen
 
@@ -196,7 +230,7 @@ Gets the lower limit of hash map bit length.
 
 the lower limit value
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:207`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:274`_
 
 ### getNumRandomSamplings
 
@@ -210,7 +244,7 @@ Gets the number of iterations of initial random seed node selection.
 
 the number of iterations
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:216`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:283`_
 
 ### getHashMapMaxFillRate
 
@@ -224,7 +258,7 @@ Gets the upper limit of hash map fill rate.
 
 the upper limit of hash map fill rate
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:225`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:292`_
 
 ### getRandXORMask
 
@@ -238,7 +272,7 @@ Gets the bit mask used for initial random seed node selection.
 
 the bit mask value
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:234`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:301`_
 
 ### getCagraSearchAlgo
 
@@ -252,7 +286,7 @@ Gets which search implementation is configured.
 
 the configured `SearchAlgo`
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:243`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:310`_
 
 ### getHashMapMode
 
@@ -266,7 +300,49 @@ Gets the hash map mode configured.
 
 the configured `HashMapMode`
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:252`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:319`_
+
+### getFilteringRate
+
+```java
+public float getFilteringRate()
+```
+
+Gets the rate of nodes to be filtered-out, when filtering is used.
+
+**Returns**
+
+the filtering rate, or 0 when it is automatically calculated
+
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:328`_
+
+### getFilterExpansion
+
+```java
+public FilterExpansion getFilterExpansion()
+```
+
+Gets how a filtered search traverses the graph.
+
+**Returns**
+
+the configured `FilterExpansion`
+
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:337`_
+
+### getQueryBitsets
+
+```java
+public long getQueryBitsets()
+```
+
+Gets the device address of the array with one bitset pointer per query.
+
+**Returns**
+
+the device address, or 0 when there are no per-query bitsets
+
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:346`_
 
 ### Builder
 
@@ -276,7 +352,7 @@ public Builder()
 
 Default constructor.
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:309`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:412`_
 
 ### withMaxQueries
 
@@ -297,7 +373,7 @@ Auto select when 0.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:318`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:421`_
 
 ### withItopkSize
 
@@ -319,7 +395,7 @@ Higher values improve the search accuracy.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:331`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:434`_
 
 ### withMaxIterations
 
@@ -339,7 +415,7 @@ Sets the upper limit of search iterations. Auto select when 0.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:342`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:445`_
 
 ### withAlgo
 
@@ -359,7 +435,7 @@ Sets which search implementation to use.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:353`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:456`_
 
 ### withTeamSize
 
@@ -380,7 +456,7 @@ Sets the number of threads used to calculate a single distance. 4, 8, 16, or
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:365`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:468`_
 
 ### withSearchWidth
 
@@ -401,7 +477,7 @@ in each iteration.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:377`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:480`_
 
 ### withMinIterations
 
@@ -421,7 +497,7 @@ Sets the lower limit of search iterations.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:388`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:491`_
 
 ### withThreadBlockSize
 
@@ -442,7 +518,7 @@ Sets the thread block size. 0, 64, 128, 256, 512, 1024. Auto selection when
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:400`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:503`_
 
 ### withHashMapMode
 
@@ -462,7 +538,7 @@ Sets the hash map type. Auto selection when AUTO.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:411`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:514`_
 
 ### withHashMapMinBitlen
 
@@ -482,7 +558,7 @@ Sets the lower limit of hash map bit length. More than 8.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:422`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:525`_
 
 ### withHashMapMaxFillRate
 
@@ -502,7 +578,7 @@ Sets the upper limit of hash map fill rate. More than 0.1, less than 0.9.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:433`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:536`_
 
 ### withNumRandomSamplings
 
@@ -523,7 +599,7 @@ more.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:446`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:549`_
 
 ### withRandXorMask
 
@@ -543,7 +619,106 @@ Sets the bit mask used for initial random seed node selection.
 
 an instance of this Builder
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:457`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:560`_
+
+### withFilteringRate
+
+```java
+public Builder withFilteringRate(float filteringRate)
+```
+
+Sets the rate of nodes to be filtered-out, when filtering is used.
+
+The value must be greater than 0.0 and less than 1.0. When set to 0
+(default), the filtering rate is automatically calculated: each
+`CagraIndex` search with a prefilter then counts the bits of the
+prefilter and waits for the result, unless the filter expansion is
+`FilterExpansion#PASSING_TWO_HOP`, which does not use the rate.
+`MultiPartitionCagraSearch` then counts the bits of the partition
+filters in every call.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `filteringRate` | the rate of nodes to be filtered-out |
+
+**Returns**
+
+an instance of this Builder
+
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:579`_
+
+### withFilterExpansion
+
+```java
+public Builder withFilterExpansion(FilterExpansion filterExpansion)
+```
+
+Sets how a filtered search traverses the graph (see
+`FilterExpansion`). Default: `FilterExpansion#SCORE_ALL`.
+
+`FilterExpansion#PASSING_TWO_HOP` is implemented by the
+MULTI_CTA algorithm only. It selects MULTI_CTA when the search algorithm
+is `SearchAlgo#AUTO`. The other algorithms ignore it and log a
+warning. `MultiPartitionCagraSearch` always uses
+`FilterExpansion#SCORE_ALL`. The value has no effect on a search
+without a prefilter.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `filterExpansion` | the `FilterExpansion` to use |
+
+**Returns**
+
+an instance of this Builder
+
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:598`_
+
+### withQueryBitsets
+
+```java
+public Builder withQueryBitsets(long queryBitsets)
+```
+
+Sets per-query filter bitsets for MULTI_CTA search. Not used when 0
+(default).
+
+When not 0, this is the device address of an array with one pointer
+per query of the search call. Each pointer is the device address of the
+32-bit words of the bitset for that query, with one bit per row of the
+index: row `i` passes the filter when bit `i % 32` of word
+`i / 32` is set. A null pointer leaves that query unfiltered. The
+bitset of the prefilter given to the query is not read, so queries with
+different filters can share one search call.
+
+The query must be given a prefilter with
+`CagraQuery.Builder#withPrefilter`. The search algorithm must be
+`SearchAlgo#MULTI_CTA` or `SearchAlgo#AUTO`, which then
+selects MULTI_CTA; the search fails with any other algorithm. With
+`FilterExpansion#SCORE_ALL`, the filtering rate must be greater
+than 0, because it is not calculated from per-query bitsets.
+`FilterExpansion#PASSING_TWO_HOP` does not use it.
+`MultiPartitionCagraSearch` and `TieredIndex` do not support
+per-query bitsets and fail when this value is not 0.
+
+The array and the bitsets are not copied: they must reside on the
+device that the search runs on and must remain valid until the work that
+the search submits to the CUDA stream has completed.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `queryBitsets` | the device address of an array with one bitset pointer per query, or 0 for none |
+
+**Returns**
+
+an instance of this Builder
+
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:633`_
 
 ### build
 
@@ -558,6 +733,6 @@ parameters.
 
 an instance of CagraSearchParams
 
-_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:468`_
+_Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:644`_
 
 _Source: `java/cuvs-java/src/main/java/com/nvidia/cuvs/CagraSearchParams.java:13`_
