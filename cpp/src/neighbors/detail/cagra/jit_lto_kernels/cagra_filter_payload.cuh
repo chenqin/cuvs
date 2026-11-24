@@ -14,6 +14,11 @@ namespace cuvs::neighbors::cagra::detail {
 
 /// `search_params::filter_expansion` is PASSING_TWO_HOP.
 inline constexpr std::uint32_t kCagraFilterPassingTwoHop = 1u << 0;
+/// `filter_data` points to a `bitset_filter_data_t` with standard 32-bit packing: row `i` passes
+/// the filter when bit `i % 32` of `bitset_ptr[i / 32]` is set. The kernel tests the words
+/// directly instead of calling the linked `sample_filter`. Set only together with
+/// `kCagraFilterPassingTwoHop`.
+inline constexpr std::uint32_t kCagraFilterBitsetWords = 1u << 1;
 
 /// Device payload for linked CAGRA sample filters plus query offset for wrapped filters.
 template <typename SourceIndexT>
