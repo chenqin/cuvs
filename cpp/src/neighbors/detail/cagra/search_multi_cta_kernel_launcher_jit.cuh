@@ -21,6 +21,7 @@
 #include <cuvs/distance/distance.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/logger.hpp>
+#include <raft/util/cuda_rt_essentials.hpp>
 #include <raft/util/kernel_launch.hpp>
 #include <rtcx/algorithm_launcher.hpp>
 
@@ -81,6 +82,24 @@ void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
   }
 }
 
+// Whether select_and_run() launches the search_multi_cta_small entry point. It does for thread
+// blocks of at most kSmallBlockMaxThreads threads, if the multiprocessors of the current device
+// hold kSmallBlockMinBlocksPerSm such thread blocks. On GPUs whose multiprocessors hold fewer
+// threads (compute capability 7.5), the compiler ignores the minimum number of thread blocks in the
+// launch bounds of search_multi_cta_small, and the entry point then uses more registers per thread
+// than search_multi_cta, which lowers the number of resident thread blocks.
+inline bool use_small_block_entry_point(uint32_t block_size)
+{
+  if (block_size > kSmallBlockMaxThreads) { return false; }
+  int device             = 0;
+  int max_threads_per_sm = 0;
+  RAFT_CUDA_TRY(cudaGetDevice(&device));
+  RAFT_CUDA_TRY(
+    cudaDeviceGetAttribute(&max_threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, device));
+  return static_cast<uint32_t>(max_threads_per_sm) >=
+         kSmallBlockMinBlocksPerSm * kSmallBlockMaxThreads;
+}
+
 template <typename DataT,
           typename IndexT,
           typename DistanceT,
@@ -121,7 +140,7 @@ void select_and_run(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dat
                                       sample_filter_jit_tag_t<SampleFilterT>>(
       dataset_desc,
       make_cagra_sample_filter_udf_fragment<SourceIndexT>(sample_filter),
-      /*small=*/block_size <= kSmallBlockMaxThreads);
+      /*small=*/use_small_block_entry_point(block_size));
 
   if (!launcher) { RAFT_FAIL("Failed to get JIT launcher"); }
 
