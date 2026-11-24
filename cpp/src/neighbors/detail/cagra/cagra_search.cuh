@@ -368,11 +368,12 @@ void search_multi_partition(
   static_assert(std::is_same_v<IdxT, uint32_t>, "Only uint32_t graph index type is supported");
   static_assert(std::is_same_v<DistanceT, float>, "Only float distances are supported");
 
-  // Partitions are filtered by their own bitsets with the SCORE_ALL walk: the two-hop walk and
-  // per-query bitsets are single-index features. Leaving PASSING_TWO_HOP set would only drop the
-  // candidate-list lengthening that SCORE_ALL needs.
+  // Multi-partition search supports neither per-query bitsets nor PASSING_TWO_HOP: every partition
+  // is filtered by its own bitset (partition_bitsets), and the multi-partition kernels always use
+  // the SCORE_ALL traversal. Reset filter_expansion so that the search plan increases itopk_size
+  // by the filtering rate, as SCORE_ALL requires.
   RAFT_EXPECTS(params.query_bitsets == nullptr,
-               "search_params::query_bitsets is not supported by multi-partition search");
+               "search_params::query_bitsets is not supported for multi-partition search");
   params.filter_expansion = filter_expansion_mode::SCORE_ALL;
 
   // The index type in this signature pins the dataset view to the default, so every partition is

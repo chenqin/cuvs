@@ -31,11 +31,16 @@ using cuvs::neighbors::cagra::detail::device::compute_distance_to_child_nodes_ji
 using cuvs::neighbors::cagra::detail::device::compute_distance_to_random_nodes_jit;
 using cuvs::neighbors::detail::sample_filter;
 
-// Start nodes of a PASSING_TWO_HOP search: `num_pickup` slots, each the nearest of
-// `num_distilation` random nodes that pass the filter. With the filter's words at hand
-// (`filter_words`, indexed by node id) a draw reads random words and takes a set bit of the first
-// that has one, so it costs a few loads however few rows pass; otherwise it tests random nodes
-// one by one with `passes`. A slot whose draws all fail stays empty.
+// PASSING_TWO_HOP version of compute_distance_to_random_nodes_jit: the initial random seed nodes
+// are selected only among the nodes that pass the filter.
+//
+// Each of the `num_pickup` entries of the result is the nearest of up to `num_distilation` random
+// nodes that pass the filter. Such a node is searched for in at most kRounds * kWide attempts:
+//   - filter_words != nullptr: read a random word of the bitset and, if it is not zero, take one
+//     of its set bits. The bitset must be indexed by graph node id (see node_filter_words in
+//     search_core).
+//   - filter_words == nullptr: pick a random node and test it with `passes`.
+// An entry stays invalid if no node that passes the filter is found.
 template <typename IndexT, typename DistanceT, typename DataT, typename PassT>
 RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
   IndexT* __restrict__ result_indices_ptr,       // [num_pickup]
@@ -50,20 +55,22 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
   const uint32_t traversed_hash_bitlen,
   const uint32_t block_id,
   const uint32_t num_blocks,
-  const IndexT node_limit,
-  const std::uint32_t* __restrict__ filter_words,
+  const IndexT seed_index_limit,
+  const uint32_t* __restrict__ filter_words,
   PassT passes)
 {
   constexpr IndexT invalid_index = ~static_cast<IndexT>(0);
-  constexpr uint32_t kRounds     = 8;  // rounds of kWide tries a draw
-  constexpr uint32_t kWide       = 4;  // words (or nodes) read together in a round
-  // Added to the random state for every try of a draw (2^64 divided by the golden ratio).
+  constexpr uint32_t kRounds     = 8;  // max rounds of attempts to find one random node
+  constexpr uint32_t kWide       = 4;  // attempts per round (bitset words loaded together)
+  // Multiplied by the attempt number and added to gid, so that every attempt uses a different
+  // random number (2^64 / golden ratio).
   constexpr uint64_t kTryIncrement = 0x9E3779B97F4A7C15ull;
 
   const uint32_t team_size_bits = smem_desc->team_size_bitshift_from_smem();
   const auto args_load          = smem_desc->args.load();
   const auto max_i = raft::round_up_safe<uint32_t>(num_pickup, device::warp_size >> team_size_bits);
-  const uint32_t num_words = static_cast<uint32_t>((static_cast<uint64_t>(node_limit) + 31) / 32);
+  const uint32_t num_words =
+    static_cast<uint32_t>((static_cast<uint64_t>(seed_index_limit) + 31) / 32);
 
   for (uint32_t i = threadIdx.x >> team_size_bits; i < max_i; i += (blockDim.x >> team_size_bits)) {
     const bool valid_i = (i < num_pickup);
@@ -85,22 +92,23 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
           // The low bits of a random number choose the bit within a word; the word (or the
           // node) is chosen by the bits above them.
           if (filter_words != nullptr) {
-            std::uint32_t word[kWide];
+            uint32_t word[kWide];
             for (uint32_t u = 0; u < kWide; u++) {
               word[u] = filter_words[(r[u] >> 8) % num_words];
             }
             for (uint32_t u = 0; u < kWide && seed_index == invalid_index; u++) {
               if (word[u] == 0) { continue; }
-              // A set bit picked by a random rotation, so a word does not always give its lowest.
+              // Take the first set bit at or above bit `rot`, wrapping around, so that the
+              // lowest set bit of a word is not always the one that is selected.
               const uint32_t rot     = static_cast<uint32_t>(r[u]) & 31u;
               const uint32_t rotated = (word[u] >> rot) | (word[u] << ((32u - rot) & 31u));
               const uint32_t bit     = (static_cast<uint32_t>(__ffs(rotated)) - 1u + rot) & 31u;
               const uint64_t node    = ((r[u] >> 8) % num_words) * 32ull + bit;
-              if (node < node_limit) { seed_index = static_cast<IndexT>(node); }
+              if (node < seed_index_limit) { seed_index = static_cast<IndexT>(node); }
             }
           } else {
             for (uint32_t u = 0; u < kWide && seed_index == invalid_index; u++) {
-              const IndexT node = static_cast<IndexT>((r[u] >> 8) % node_limit);
+              const IndexT node = static_cast<IndexT>((r[u] >> 8) % seed_index_limit);
               if (passes(node)) { seed_index = node; }
             }
           }
@@ -121,12 +129,12 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
     if (valid_i && lane_id == 0) {
       if (best_index_team_local != raft::upper_bound<IndexT>()) {
         if (hashmap::insert(visited_hash_ptr, visited_hash_bitlen, best_index_team_local) == 0) {
-          // The same node was drawn for another slot.
+          // Deactivate this entry as insertion into visited hash table has failed.
           best_norm2_team_local = raft::upper_bound<DistanceT>();
           best_index_team_local = raft::upper_bound<IndexT>();
         } else if (hashmap::search<IndexT, 1>(
                      traversed_hash_ptr, traversed_hash_bitlen, best_index_team_local)) {
-          // Another block has expanded it already.
+          // Deactivate this entry as it has been already used by others.
           best_norm2_team_local = raft::upper_bound<DistanceT>();
           best_index_team_local = raft::upper_bound<IndexT>();
         }
@@ -137,11 +145,19 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
   }
 }
 
-// Children of a PASSING_TWO_HOP parent, with their distances: the parent's neighbors that pass
-// the filter and, through each neighbor that does not, that neighbor's own passing neighbors.
-// A rejected node is never scored and never enters the list. Children fill the buffer from
-// `max_result_position` down to `min_result_position`; the first hop goes first and what does
-// not fit is dropped. On return `result_position[0]` is the first slot filled.
+// PASSING_TWO_HOP version of compute_distance_to_child_nodes_jit, for one parent node. The child
+// nodes of the parent are
+//   - first hop: the neighbors of the parent that pass the filter, and
+//   - second hop: for every neighbor of the parent that is filtered out (a "bridge"), the
+//     neighbors of the bridge that pass the filter.
+// Distances are computed for the child nodes only; a filtered-out node is never written to the
+// result buffer.
+//
+// The child nodes are written to `result_indices_ptr` / `result_distances_ptr` from position
+// `max_result_position - 1` downwards, and never below `min_result_position`. The first hop is
+// completed before the second hop starts, and child nodes that do not fit are dropped.
+// `result_position[0]` must be `max_result_position` on entry. On return, it is the lowest
+// position that holds a child node (`max_result_position` if there is none).
 template <typename IndexT, typename DistanceT, typename DataT, typename PassT>
 RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
   IndexT* __restrict__ result_indices_ptr,
@@ -158,13 +174,14 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
   int* __restrict__ result_position,
   const int min_result_position,
   const int max_result_position,
-  const std::uint32_t* __restrict__ filter_words,  // indexed by node id, or nullptr
+  const uint32_t* __restrict__ filter_words,  // indexed by graph node id, or nullptr
   PassT passes)
 {
   constexpr IndexT invalid_index = ~static_cast<IndexT>(0);
 
-  // A passing node becomes a child unless it is on this block's list already or some block has
-  // expanded it.
+  // Add `child` to the child nodes unless it cannot be inserted into the visited hash table of
+  // this CTA (it is already registered, or the table is full) or a CTA of the same query has
+  // already used it as a parent. A child node that does not fit in the result buffer is dropped.
   auto take = [&](const IndexT child) {
     if (hashmap::insert(visited_hashmap_ptr, visited_hash_bitlen, child) == 0) { return; }
     if (hashmap::search<IndexT, 1>(traversed_hashmap_ptr, traversed_hash_bitlen, child)) { return; }
@@ -172,7 +189,8 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
     if (j >= min_result_position) { result_indices_ptr[j] = child; }
   };
 
-  // First hop: passing neighbors are children, the others are bridges to the second hop.
+  // First hop: a neighbor of the parent that passes the filter becomes a child node. A neighbor
+  // that is filtered out is stored in `bridges`; its neighbors are examined in the second hop.
   for (uint32_t i = threadIdx.x; i < knn_k; i += blockDim.x) {
     IndexT bridge = invalid_index;
     if (parent_id != invalid_index) {
@@ -189,17 +207,29 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
   }
   __syncthreads();
 
-  // Second hop: the neighbors of each bridge, until the buffer is full. A thread reads a few
-  // graph entries, then their filter words, before it uses any of them, so the loads overlap;
-  // a warp's threads read one bridge's row together. Between two looks at the buffer a round
-  // examines kSlotsPerRound entries, or one entry a thread in a larger block. The visited hash
-  // is sized for a round of kSlotsPerRound (see search_plan.cuh); a child it has no room for is
-  // dropped.
-  constexpr uint32_t kSlotsPerRound = 256;
-  constexpr uint32_t kMaxUnroll     = 4;
+  // Second hop: examine the neighbors of every bridge until the child part of the result buffer
+  // is full.
+  //
+  // Slot `s` is entry `s % knn_k` of the graph row of `bridges[s / knn_k]`. In one round (one
+  // iteration of the loop below) a thread handles `unroll` slots. It first loads all their graph
+  // entries, then (when filter_words is given) all their bitset words, and only then tests them,
+  // so that the loads of each step are independent of each other. `unroll` is
+  // kSlotsPerRound / blockDim.x, limited to the range [1, kMaxUnroll]: the thread block handles
+  // kSlotsPerRound slots per round, or one slot per thread when it has more than kSlotsPerRound
+  // threads.
+  //
+  // A thread checks whether the buffer is full once per round, and reads `result_position[0]`
+  // without synchronization for that. This is safe: the value only decreases, so a stale value
+  // only delays the exit, and take() drops the child nodes that do not fit. The child nodes that
+  // are registered in the visited hash table in the meantime are the reason for the extra entries
+  // that search_plan.cuh adds to it (kTwoHopExtraVisitedNodes). When the table is full, take()
+  // drops the child node.
+  constexpr uint32_t kSlotsPerRound = 256;  // slots per round for the thread block
+  constexpr uint32_t kMaxUnroll     = 4;    // max slots per round for a thread
   const uint32_t num_slots          = knn_k * knn_k;
-  const uint32_t per_thread         = kSlotsPerRound / blockDim.x;
-  const uint32_t unroll = per_thread < 1 ? 1u : (per_thread > kMaxUnroll ? kMaxUnroll : per_thread);
+  const uint32_t slots_per_thread   = kSlotsPerRound / blockDim.x;
+  const uint32_t unroll =
+    slots_per_thread < 1 ? 1u : (slots_per_thread > kMaxUnroll ? kMaxUnroll : slots_per_thread);
   for (uint32_t s0 = threadIdx.x; s0 < num_slots; s0 += blockDim.x * unroll) {
     if (result_position[0] <= min_result_position) { break; }
     IndexT child[kMaxUnroll];
@@ -211,7 +241,7 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
                               : invalid_index;
     }
     if (filter_words != nullptr) {
-      std::uint32_t word[kMaxUnroll];
+      uint32_t word[kMaxUnroll];
       for (uint32_t u = 0; u < kMaxUnroll; u++) {
         word[u] = (child[u] != invalid_index) ? filter_words[child[u] >> 5] : 0u;
       }
@@ -226,7 +256,7 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
   }
   __syncthreads();
 
-  // Distances of the children, as compute_distance_to_child_nodes_jit computes them.
+  // Compute the distances of the child nodes, as compute_distance_to_child_nodes_jit does.
   const auto team_size_bits = smem_desc->team_size_bitshift_from_smem();
   const int first =
     result_position[0] < min_result_position ? min_result_position : result_position[0];
@@ -251,7 +281,9 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
 
     if (valid_i && lead_lane) { result_distances_ptr[j] = child_dist; }
   }
-  // Slots below the list's end were never written.
+  // take() decrements result_position[0] even when a child node does not fit, so it can be below
+  // min_result_position. Set it to the lowest position that holds a child node, which is what
+  // the caller expects.
   if (threadIdx.x == 0) { result_position[0] = first; }
 }
 
@@ -317,18 +349,24 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
   // Generalized row index: single-partition launches gridDim.z == 1 so row == query_id.
   const auto row = partition_id * num_queries + query_id;
 
-  // The filter. When the host says it is a bitset whose words can be read as they are (see the
-  // kCagraFilter* flags), a test is one load of a word; any other filter goes through the
-  // linked sample_filter. With one bitset per query, a query whose pointer is null is unfiltered.
-  // Seed nodes given by the caller are not filtered, so a search that has them keeps the
-  // SCORE_ALL walk and its filtering of the list.
+  // PASSING_TWO_HOP is used only without seed nodes (seed_ptr == nullptr). Seed nodes supplied by
+  // the caller are not filtered, so a search with seed nodes uses the SCORE_ALL traversal, which
+  // removes the filtered-out nodes from the result buffer. The host does not pass seed nodes to
+  // this kernel at present.
   const bool passing_two_hop =
     (filter_payload.flags & kCagraFilterPassingTwoHop) != 0 && seed_ptr == nullptr;
-  const bool has_query_bitsets      = (filter_payload.flags & kCagraFilterQueryBitsets) != 0;
-  const std::uint32_t* filter_words = nullptr;
+
+  // Filter setup (see the kCagraFilter* flags in cagra_filter_payload.cuh):
+  //   - kCagraFilterQueryBitsets: filter_words is the bitset of this query. A null pointer means
+  //                               that the query is not filtered.
+  //   - kCagraFilterBitsetWords:  filter_words is the bitset of the filter object.
+  //   - otherwise:                filter_words is null and `passes` calls the linked
+  //                               sample_filter.
+  const bool has_query_bitsets = (filter_payload.flags & kCagraFilterQueryBitsets) != 0;
+  const uint32_t* filter_words = nullptr;
   if (has_query_bitsets) {
-    filter_words = static_cast<const std::uint32_t* const*>(
-      filter_payload.filter_data)[query_id + query_id_offset];
+    filter_words =
+      static_cast<const uint32_t* const*>(filter_payload.filter_data)[query_id + query_id_offset];
   } else if (filter_payload.flags & kCagraFilterBitsetWords) {
     filter_words = static_cast<const BitsetT*>(filter_payload.filter_data)->bitset_ptr;
   }
@@ -339,8 +377,9 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
     return sample_filter<SourceIndexT>(
       query_id + query_id_offset, source, filter_payload.sample_filter_data());
   };
-  // The same words indexed by graph node id, which they are unless nodes are renumbered.
-  const std::uint32_t* const node_filter_words =
+  // filter_words is indexed by source index. It can be indexed by graph node id only when the
+  // two are identical, i.e. when there is no source index mapping (source_indices_ptr == nullptr).
+  const uint32_t* const node_filter_words =
     (source_indices_ptr == nullptr) ? filter_words : nullptr;
 
 #ifdef _CLK_BREAKDOWN
@@ -385,8 +424,8 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
   auto* __restrict__ parent_indices_buffer =
     reinterpret_cast<INDEX_T*>(local_visited_hashmap_ptr + hashmap::get_size(visited_hash_bitlen));
   auto* __restrict__ result_position = reinterpret_cast<int*>(parent_indices_buffer + 1);
-  // PASSING_TWO_HOP only (the host adds it to the block's shared memory then): the expanded
-  // node's rejected neighbors.
+  // [graph_degree] Neighbors of the parent that are filtered out (bridges). The host adds this
+  // buffer to the shared memory only for PASSING_TWO_HOP (see smem_size in search_multi_cta.cuh).
   auto* __restrict__ bridges = reinterpret_cast<INDEX_T*>(result_position + 1);
 
   INDEX_T* const local_traversed_hashmap_ptr =
@@ -576,7 +615,8 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
     __syncthreads();
     _CLK_REC(clk_compute_distance);
 
-    // Filtering. A PASSING_TWO_HOP list holds passing nodes only: nothing to remove.
+    // Filtering - remove the parent from the result buffer if it is filtered out. Not needed for
+    // PASSING_TWO_HOP, whose result buffer only holds nodes that pass the filter.
     if (!passing_two_hop) {
       for (unsigned p = threadIdx.x; p < 1; p += blockDim.x) {
         if (parent_indices_buffer[p] != invalid_index) {
@@ -595,7 +635,8 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
     iter++;
   }
 
-  // Filtering
+  // Filtering - remove the filtered-out nodes from the result buffer. Not needed for
+  // PASSING_TWO_HOP (see above).
   if (!passing_two_hop) {
     for (uint32_t i = threadIdx.x; i < result_buffer_size_32; i += blockDim.x) {
       INDEX_T index = result_indices_buffer[i];

@@ -30,10 +30,15 @@
 
 namespace cuvs::neighbors::cagra::detail::multi_cta_search {
 
-// What the MULTI_CTA kernel may do with a filter beyond calling the linked sample_filter (see
-// the kCagraFilter* flags): read a bitset's words itself, take one bitset per query, and walk
-// through passing nodes only. With the default parameters no flag is set, and the kernel calls
-// the linked sample_filter as every other kernel does.
+// Host: set the kCagraFilter* flags of `payload` (see cagra_filter_payload.cuh) from the search
+// parameters and the type of the filter that `sample_filter` wraps:
+//   - kCagraFilterPassingTwoHop: `ps.filter_expansion` is PASSING_TWO_HOP, with any filter type.
+//   - kCagraFilterBitsetWords:   PASSING_TWO_HOP with a bitset_filter whose bitset is not null and
+//                                uses standard 32-bit packing, and no `ps.query_bitsets`.
+//   - kCagraFilterQueryBitsets:  `ps.query_bitsets` is given. It replaces `payload.filter_data`
+//                                and requires a bitset_filter that uses standard 32-bit packing.
+// With the default search parameters no flag is set, and the kernel filters with the linked
+// sample_filter only.
 template <typename SourceIndexT, typename SampleFilterT>
 void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
                                 const SampleFilterT& sample_filter,
@@ -47,26 +52,32 @@ void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
     const bool two_hop = ps.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP;
     if constexpr (is_bitset_filter<inner_t>::value) {
       const auto view = sample_filter.filter.view();
-      // bitset_view::test() is `(word[i / 32] >> (i % 32)) & 1` for 32-bit words that were not
-      // repacked from another word size.
-      const bool plain_words = sizeof(*view.data()) == sizeof(std::uint32_t) &&
-                               (view.get_original_nbits() == 0 || view.get_original_nbits() == 32);
+      // The kernel tests bit `i % 32` of word `i / 32`, which matches bitset_view::test() only
+      // for standard 32-bit packing (32-bit elements, original_nbits 0 or 32).
+      const bool standard_packing =
+        sizeof(*view.data()) == sizeof(uint32_t) &&
+        (view.get_original_nbits() == 0 || view.get_original_nbits() == 32);
       if (ps.query_bitsets != nullptr) {
-        RAFT_EXPECTS(plain_words, "query_bitsets needs a bitset_filter of 32-bit words");
+        RAFT_EXPECTS(standard_packing,
+                     "search_params::query_bitsets requires a bitset_filter that uses standard "
+                     "32-bit packing");
         payload.filter_data = const_cast<void*>(static_cast<const void*>(ps.query_bitsets));
         payload.flags |= kCagraFilterQueryBitsets;
-      } else if (two_hop && plain_words && payload.filter_data != nullptr &&
+      } else if (two_hop && standard_packing && payload.filter_data != nullptr &&
                  view.data() != nullptr) {
         payload.flags |= kCagraFilterBitsetWords;
       }
     } else {
-      RAFT_EXPECTS(ps.query_bitsets == nullptr, "query_bitsets needs a bitset_filter");
+      RAFT_EXPECTS(ps.query_bitsets == nullptr,
+                   "search_params::query_bitsets requires a bitset_filter");
     }
-    // The plan sizes the candidate list and the shared memory by the same parameter, so the
-    // kernel must walk as it says whatever the filter keeps in its payload.
+    // The flag is set for every filter type, not only for bitsets: the search plan has already
+    // set itopk_size and sized the visited hash table and the shared memory from
+    // `ps.filter_expansion`, so the kernel has to run in the same mode.
     if (two_hop) { payload.flags |= kCagraFilterPassingTwoHop; }
   } else {
-    RAFT_EXPECTS(ps.query_bitsets == nullptr, "query_bitsets needs a bitset_filter");
+    RAFT_EXPECTS(ps.query_bitsets == nullptr,
+                 "search_params::query_bitsets requires a bitset_filter");
   }
 }
 
@@ -110,7 +121,7 @@ void select_and_run(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dat
                                       sample_filter_jit_tag_t<SampleFilterT>>(
       dataset_desc,
       make_cagra_sample_filter_udf_fragment<SourceIndexT>(sample_filter),
-      block_size <= 256);
+      /*small=*/block_size <= kSmallBlockMaxThreads);
 
   if (!launcher) { RAFT_FAIL("Failed to get JIT launcher"); }
 

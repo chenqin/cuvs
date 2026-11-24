@@ -873,8 +873,10 @@ inline auto validate_sample_filter(cuvs::neighbors::filtering::base_filter const
 }
 
 /**
- * Batching re-lays the query rows, so upstream parameters that hold one entry per query are
- * refused for the same reason as a roaring_bitmap_filter.
+ * Reject upstream search parameters that hold one entry per query (`query_bitsets`). Dynamic
+ * batching combines requests into a different query-row layout, so the entries would no longer
+ * match the rows of the batched queries. validate_sample_filter() rejects roaring_bitmap_filter
+ * for the same reason.
  */
 template <typename SearchParamsT>
 inline auto validate_upstream_params(const SearchParamsT& upstream_params) -> const SearchParamsT&

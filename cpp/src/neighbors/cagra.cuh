@@ -445,9 +445,13 @@ inline float bitset_filtering_rate(
 }
 
 /**
- * PASSING_TWO_HOP and query_bitsets belong to the MULTI_CTA algorithm. As `persistent` does for
- * SINGLE_CTA, they choose the algorithm of a filtered search when it is left to AUTO, and a walk
- * that the chosen algorithm will not do is reported.
+ * Resolve `params.algo` for a filtered search that uses PASSING_TWO_HOP or `query_bitsets`, which
+ * are implemented by the MULTI_CTA search algorithm only.
+ *
+ * AUTO becomes MULTI_CTA unless `persistent` is set (search_plan_impl_base then selects
+ * SINGLE_CTA). If PASSING_TWO_HOP is requested and the algorithm is not MULTI_CTA after that, a
+ * warning is logged, because the other algorithms ignore PASSING_TWO_HOP. `query_bitsets` with an
+ * algorithm other than MULTI_CTA is rejected by search_plan_impl::check_params().
  */
 inline void resolve_filtered_search_algo(search_params& params)
 {
@@ -455,6 +459,7 @@ inline void resolve_filtered_search_algo(search_params& params)
   if (!two_hop && params.query_bitsets == nullptr) { return; }
   if (params.algo == search_algo::AUTO && !params.persistent) {
     params.algo = search_algo::MULTI_CTA;
+    RAFT_LOG_DEBUG("Auto strategy: PASSING_TWO_HOP or query_bitsets set, selecting multi-cta");
   } else if (two_hop && params.algo != search_algo::MULTI_CTA) {
     RAFT_LOG_WARN(
       "CAGRA filter_expansion PASSING_TWO_HOP is only supported with MULTI_CTA search (algo=%d); "
@@ -480,9 +485,11 @@ void search(raft::resources const& res,
     auto& sample_filter       = dynamic_cast<const none_filter_type&>(sample_filter_ref);
     search_params params_copy = params;
     if (params.filtering_rate < 0.0) { params_copy.filtering_rate = 0.0; }
-    // Without a filter there is nothing to walk around.
+    // PASSING_TWO_HOP applies to filtered searches only. Reset it so that an unfiltered search is
+    // planned and run as SCORE_ALL.
     params_copy.filter_expansion = filter_expansion_mode::SCORE_ALL;
-    auto sample_filter_copy      = sample_filter;
+
+    auto sample_filter_copy = sample_filter;
     return search_with_filtering<T, IdxT, none_filter_type, OutputIdxT, DatasetViewT>(
       res, params_copy, idx, queries, neighbors, distances, sample_filter_copy);
   } catch (const std::bad_cast&) {
@@ -496,11 +503,13 @@ void search(raft::resources const& res,
     resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0) {
       if (params.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
-        // The rate only lengthens the SCORE_ALL candidate list: do not count the bitset for it.
+        // PASSING_TWO_HOP does not use the filtering rate (itopk_size is increased by it only
+        // for SCORE_ALL), so the bits of the filter are not counted.
         params_copy.filtering_rate = 0.0;
       } else {
         RAFT_EXPECTS(params.query_bitsets == nullptr,
-                     "search_params::filtering_rate must be given with query_bitsets");
+                     "search_params::filtering_rate must be given when "
+                     "search_params::query_bitsets is used with filter_expansion_mode::SCORE_ALL.");
         params_copy.filtering_rate = bitset_filtering_rate(
           res, {static_cast<int64_t>(idx.dataset().n_rows())}, {sample_filter.bitset_view_});
       }

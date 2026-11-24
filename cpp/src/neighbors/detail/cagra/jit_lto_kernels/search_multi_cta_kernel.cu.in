@@ -68,9 +68,11 @@ extern "C" __global__ __launch_bounds__(1024, 1) void search_multi_cta(
                                                                  filter_payload);
 }
 
-// The same kernel for blocks of at most 256 threads: a register budget of about 40 a thread lets
-// more warps stay resident (the kernel is latency-bound), where the 1024-thread variant allows 64.
-extern "C" __global__ __launch_bounds__(256, 6) void search_multi_cta_small(
+// Variant of search_multi_cta for thread blocks of at most kSmallBlockMaxThreads threads. Its
+// launch bounds request that at least 6 thread blocks of that size fit on a multiprocessor; those
+// of search_multi_cta request one thread block of 1024 threads. select_and_run() launches this
+// variant when the thread block size is at most kSmallBlockMaxThreads.
+extern "C" __global__ __launch_bounds__(kSmallBlockMaxThreads, 6) void search_multi_cta_small(
   index_t* const result_indices_ptr,
   distance_t* const result_distances_ptr,
   const dataset_desc_base* dataset_desc,
@@ -120,6 +122,9 @@ extern "C" __global__ __launch_bounds__(256, 6) void search_multi_cta_small(
 
 static_assert(
   std::is_same_v<decltype(search_multi_cta),
+                 search_multi_cta_kernel_func_t<data_t, index_t, distance_t, source_index_t>>);
+static_assert(
+  std::is_same_v<decltype(search_multi_cta_small),
                  search_multi_cta_kernel_func_t<data_t, index_t, distance_t, source_index_t>>);
 
 }  // namespace cuvs::neighbors::cagra::detail::multi_cta_search

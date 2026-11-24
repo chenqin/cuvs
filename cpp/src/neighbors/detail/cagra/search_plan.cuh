@@ -199,7 +199,8 @@ struct search_plan_impl : public search_plan_impl_base {
 
   void adjust_search_params()
   {
-    // A PASSING_TWO_HOP list holds no rejected nodes to make up for.
+    // Increase itopk_size to compensate for the filtered-out nodes in the itopk list. Not needed
+    // for PASSING_TWO_HOP, whose itopk list only holds nodes that pass the filter.
     if (algo == search_algo::MULTI_CTA &&
         filter_expansion != filter_expansion_mode::PASSING_TWO_HOP &&
         (0.0 < filtering_rate && filtering_rate < 1.0)) {
@@ -277,13 +278,17 @@ struct search_plan_impl : public search_plan_impl_base {
       // table that each CTA has in the shared memory. This hash table is not
       // shared among CTAs. This hash table is reset and restored in each iteration.
       //
-      // A PASSING_TWO_HOP expansion also registers the second-hop nodes that pass. The kernel
-      // examines 256 graph entries between two looks at the child buffer (one entry a thread in
-      // a larger block), of which a share passes while the buffer is not yet full. A child the
-      // table has no room for is dropped, not duplicated.
+      // With PASSING_TWO_HOP, the second-hop child nodes are also registered in this table. The
+      // kernel checks whether the child part of the result buffer is full once per round of the
+      // second hop (see compute_distance_to_passing_child_nodes_jit), so child nodes can still be
+      // registered after it has become full. kTwoHopExtraVisitedNodes entries are added for them.
+      // The value is an empirical allowance: it is not derived from the number of graph entries
+      // that the kernel examines per round (kSlotsPerRound), and it is not an upper bound. When
+      // the table is full, the insertion fails and the kernel drops the child node.
+      constexpr uint32_t kTwoHopExtraVisitedNodes = 128;
       const uint32_t max_visited_nodes =
         mc_itopk_size + (graph_degree * 2) +
-        (filter_expansion == filter_expansion_mode::PASSING_TWO_HOP ? 128 : 0);
+        (filter_expansion == filter_expansion_mode::PASSING_TWO_HOP ? kTwoHopExtraVisitedNodes : 0);
       constexpr size_t max_small_hash_bitlen = 14;  // 16K
       small_hash_bitlen                      = 8;   // 256
       // Stop at the supported maximum rather than growing without bound: hashmap::get_size()
@@ -433,8 +438,9 @@ struct search_plan_impl : public search_plan_impl_base {
                        std::to_string(static_cast<int>(filter_expansion)) + "";
     }
     if (query_bitsets != nullptr && algo != search_algo::MULTI_CTA) {
-      // Any other kernel would filter every query by the filter object's own bitset.
-      error_message += "`query_bitsets` needs the MULTI_CTA search algorithm (set `algo`)";
+      // Only the MULTI_CTA kernel reads query_bitsets. The other kernels would apply the bitset
+      // of the filter object to every query instead.
+      error_message += "`query_bitsets` is only supported with the MULTI_CTA search algorithm.";
     }
     if (hashmap_min_bitlen > 20) {
       error_message += "`hashmap_min_bitlen` must be equal to or smaller than 20. " +

@@ -23,7 +23,9 @@ struct CagraMultiCtaSearchPlanner
   static inline rtcx::launcher_jit_cache launcher_jit_cache{};
   static inline rtcx::launcher_jit_cache launcher_jit_cache_small{};
 
-  // small: the variant compiled for blocks of at most 256 threads (search_multi_cta_small).
+  /// `small` selects the `search_multi_cta_small` entry point, which is compiled for thread blocks
+  /// of at most `kSmallBlockMaxThreads` threads. Each entry point has its own launcher cache: both
+  /// are linked from the same fragments, and a cache reuses the linked kernel for a fragment key.
   CagraMultiCtaSearchPlanner(cuvs::distance::DistanceType /*metric*/,
                              uint32_t /*team_size*/,
                              uint32_t /*dataset_block_dim*/,

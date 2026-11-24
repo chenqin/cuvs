@@ -392,6 +392,8 @@ std::shared_ptr<rtcx::algorithm_launcher> make_cagra_single_cta_jit_launcher(
 }
 
 /// Build a JIT rtcx::algorithm_launcher for multi-CTA CAGRA search.
+/// `small` selects the `search_multi_cta_small` kernel entry point, which can only be launched with
+/// thread blocks of at most `kSmallBlockMaxThreads` threads.
 template <typename DataT,
           typename IndexT,
           typename DistanceT,
