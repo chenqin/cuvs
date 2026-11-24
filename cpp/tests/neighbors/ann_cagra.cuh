@@ -48,6 +48,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -313,6 +314,9 @@ struct AnnCagraInputs {
   cuvs::neighbors::cagra::internal_dtype smem_dtype = cuvs::neighbors::cagra::internal_dtype::F16;
   /** When set, physical merge uses this overload instead of the default-params merge. */
   std::optional<cagra::merge_params> physical_merge_params = std::nullopt;
+  /** How a filtered MULTI_CTA search traverses the graph (used by AnnCagraFilterTest). */
+  cuvs::neighbors::cagra::filter_expansion_mode filter_expansion =
+    cuvs::neighbors::cagra::filter_expansion_mode::SCORE_ALL;
 };
 
 inline ::std::ostream& operator<<(::std::ostream& os, const AnnCagraInputs& p)
@@ -346,6 +350,9 @@ inline ::std::ostream& operator<<(::std::ostream& os, const AnnCagraInputs& p)
   if ((int)p.build_algo == 0 && p.ivf_pq_search_refine_ratio) {
     os << "(refine_rate=" << *p.ivf_pq_search_refine_ratio << ')';
   }
+  os << ", filter_expansion="
+     << (p.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP ? "passing_two_hop"
+                                                                      : "score_all");
   os << '}' << std::endl;
   return os;
 }
@@ -889,6 +896,8 @@ class AnnCagraFilterTest : public ::testing::TestWithParam<AnnCagraInputs> {
         search_params.max_queries = ps.max_queries;
         search_params.team_size   = ps.team_size;
         search_params.itopk_size  = ps.itopk_size;
+
+        search_params.filter_expansion = ps.filter_expansion;
 
         auto database_view = raft::make_device_matrix_view<const DataT, int64_t>(
           (const DataT*)database.data(), ps.n_rows, ps.dim);
@@ -2054,6 +2063,38 @@ inline std::vector<AnnCagraInputs> generate_filtering_inputs()
     {false},
     {0.995});
   inputs.insert(inputs.end(), inputs2.begin(), inputs2.end());
+
+  // PASSING_TWO_HOP on MULTI_CTA, the only algorithm that implements it. AnnCagraFilterTest
+  // searches each input with a bitset filter and with a bloom filter. The inputs sample the dims,
+  // graph degrees and metrics of the two blocks above instead of crossing them, to limit the
+  // number of index builds. use_source_indices = true covers an index with source indices, for
+  // which the filter is tested by source index. min_recall is the value the two blocks above use.
+  for (auto [dim, graph_degree, metric, use_source_indices] :
+       std::vector<std::tuple<int, int, cuvs::distance::DistanceType, bool>>{
+         {1, 32, cuvs::distance::DistanceType::L2Expanded, false},
+         {8, 47, cuvs::distance::DistanceType::L2Expanded, true},
+         {17, 64, cuvs::distance::DistanceType::L2Expanded, false},
+         {102, 32, cuvs::distance::DistanceType::L2Expanded, false},
+         {8, 64, cuvs::distance::DistanceType::InnerProduct, false},
+         {102, 47, cuvs::distance::DistanceType::InnerProduct, true}}) {
+    inputs.push_back(AnnCagraInputs{/*n_queries*/ 100,
+                                    /*n_rows*/ 1000,
+                                    dim,
+                                    /*k*/ 16,
+                                    graph_degree,
+                                    graph_build_algo::NN_DESCENT,
+                                    search_algo::MULTI_CTA,
+                                    /*max_queries*/ 0,
+                                    /*team_size*/ 0,
+                                    /*itopk_size*/ 256,
+                                    /*search_width*/ 1,
+                                    metric,
+                                    /*host_dataset*/ false,
+                                    /*include_serialized_dataset*/ true,
+                                    use_source_indices,
+                                    /*min_recall*/ 0.995});
+    inputs.back().filter_expansion = filter_expansion_mode::PASSING_TWO_HOP;
+  }
 
   return inputs;
 }

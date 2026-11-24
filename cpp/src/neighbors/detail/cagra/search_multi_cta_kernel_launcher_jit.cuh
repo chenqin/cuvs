@@ -30,6 +30,27 @@
 
 namespace cuvs::neighbors::cagra::detail::multi_cta_search {
 
+// Host: set the kCagraFilter* flags of `payload` (see cagra_filter_payload.cuh) from the search
+// parameters:
+//   - kCagraFilterPassingTwoHop: `ps.filter_expansion` is PASSING_TWO_HOP, with any filter type.
+// With the default search parameters no flag is set.
+template <typename SourceIndexT, typename SampleFilterT>
+void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
+                                const SampleFilterT& sample_filter,
+                                const search_params& ps)
+{
+  if constexpr (requires {
+                  sample_filter.filter;
+                  sample_filter.offset;
+                }) {
+    // The search plan has already set itopk_size and sized the visited hash table and the shared
+    // memory from `ps.filter_expansion`, so the kernel has to run in the same mode.
+    if (ps.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
+      payload.flags |= kCagraFilterPassingTwoHop;
+    }
+  }
+}
+
 template <typename DataT,
           typename IndexT,
           typename DistanceT,
@@ -58,7 +79,8 @@ void select_and_run(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dat
                     SampleFilterT sample_filter,
                     cudaStream_t stream)
 {
-  const auto filter_payload      = extract_cagra_sample_filter<SourceIndexT>(sample_filter, stream);
+  auto filter_payload = extract_cagra_sample_filter<SourceIndexT>(sample_filter, stream);
+  set_multi_cta_filter_flags(filter_payload, sample_filter, ps);
   const uint32_t query_id_offset = filter_payload.query_id_offset;
 
   std::shared_ptr<rtcx::algorithm_launcher> launcher =
