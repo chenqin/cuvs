@@ -35,8 +35,12 @@ using cuvs::neighbors::detail::sample_filter;
 // are selected only among the nodes that pass the filter.
 //
 // Each of the `num_pickup` entries of the result is the nearest of up to `num_distilation` random
-// nodes that pass the filter. Such a node is searched for by testing up to kMaxAttempts random
-// nodes with `passes`. An entry stays invalid if no node that passes the filter is found.
+// nodes that pass the filter. Such a node is searched for in at most kRounds * kWide attempts:
+//   - filter_words != nullptr: read a random word of the bitset and, if it is not zero, take one
+//     of its set bits. The bitset must be indexed by graph node id (see node_filter_words in
+//     search_core).
+//   - filter_words == nullptr: pick a random node and test it with `passes`.
+// An entry stays invalid if no node that passes the filter is found.
 template <typename IndexT, typename DistanceT, typename DataT, typename PassT>
 RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
   IndexT* __restrict__ result_indices_ptr,       // [num_pickup]
@@ -52,10 +56,12 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
   const uint32_t block_id,
   const uint32_t num_blocks,
   const IndexT seed_index_limit,
+  const uint32_t* __restrict__ filter_words,
   PassT passes)
 {
-  constexpr IndexT invalid_index  = ~static_cast<IndexT>(0);
-  constexpr uint32_t kMaxAttempts = 32;  // random nodes tested to find one that passes
+  constexpr IndexT invalid_index = ~static_cast<IndexT>(0);
+  constexpr uint32_t kRounds     = 8;  // max rounds of attempts to find one random node
+  constexpr uint32_t kWide       = 4;  // attempts per round (bitset words loaded together)
   // Multiplied by the attempt number and added to gid, so that every attempt uses a different
   // random number (2^64 / golden ratio).
   constexpr uint64_t kTryIncrement = 0x9E3779B97F4A7C15ull;
@@ -63,6 +69,8 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
   const uint32_t team_size_bits = smem_desc->team_size_bitshift_from_smem();
   const auto args_load          = smem_desc->args.load();
   const auto max_i = raft::round_up_safe<uint32_t>(num_pickup, device::warp_size >> team_size_bits);
+  const uint32_t num_words =
+    static_cast<uint32_t>((static_cast<uint64_t>(seed_index_limit) + 31) / 32);
 
   for (uint32_t i = threadIdx.x >> team_size_bits; i < max_i; i += (blockDim.x >> team_size_bits)) {
     const bool valid_i = (i < num_pickup);
@@ -75,11 +83,35 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_passing_nodes_jit(
       if (valid_i) {
         const uint64_t gid =
           block_id + (static_cast<uint64_t>(num_blocks) * (i + (num_pickup * j)));
-        for (uint32_t t = 0; t < kMaxAttempts && seed_index == invalid_index; t++) {
-          const uint64_t r = cuvs::neighbors::detail::device::xorshift64(
-            (gid + kTryIncrement * (t + 1)) ^ rand_xor_mask);
-          const IndexT node = static_cast<IndexT>((r >> 8) % seed_index_limit);
-          if (passes(node)) { seed_index = node; }
+        for (uint32_t round = 0; round < kRounds && seed_index == invalid_index; round++) {
+          uint64_t r[kWide];
+          for (uint32_t u = 0; u < kWide; u++) {
+            r[u] = cuvs::neighbors::detail::device::xorshift64(
+              (gid + kTryIncrement * (round * kWide + u + 1)) ^ rand_xor_mask);
+          }
+          // The low bits of a random number choose the bit within a word; the word (or the
+          // node) is chosen by the bits above them.
+          if (filter_words != nullptr) {
+            uint32_t word[kWide];
+            for (uint32_t u = 0; u < kWide; u++) {
+              word[u] = filter_words[(r[u] >> 8) % num_words];
+            }
+            for (uint32_t u = 0; u < kWide && seed_index == invalid_index; u++) {
+              if (word[u] == 0) { continue; }
+              // Take the first set bit at or above bit `rot`, wrapping around, so that the
+              // lowest set bit of a word is not always the one that is selected.
+              const uint32_t rot     = static_cast<uint32_t>(r[u]) & 31u;
+              const uint32_t rotated = (word[u] >> rot) | (word[u] << ((32u - rot) & 31u));
+              const uint32_t bit     = (static_cast<uint32_t>(__ffs(rotated)) - 1u + rot) & 31u;
+              const uint64_t node    = ((r[u] >> 8) % num_words) * 32ull + bit;
+              if (node < seed_index_limit) { seed_index = static_cast<IndexT>(node); }
+            }
+          } else {
+            for (uint32_t u = 0; u < kWide && seed_index == invalid_index; u++) {
+              const IndexT node = static_cast<IndexT>((r[u] >> 8) % seed_index_limit);
+              if (passes(node)) { seed_index = node; }
+            }
+          }
         }
       }
       const bool valid_seed = valid_i && (seed_index != invalid_index);
@@ -142,6 +174,7 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
   int* __restrict__ result_position,
   const int min_result_position,
   const int max_result_position,
+  const uint32_t* __restrict__ filter_words,  // indexed by graph node id, or nullptr
   PassT passes)
 {
   constexpr IndexT invalid_index = ~static_cast<IndexT>(0);
@@ -179,7 +212,8 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
   //
   // Slot `s` is entry `s % knn_k` of the graph row of `bridges[s / knn_k]`. In one round (one
   // iteration of the loop below) a thread handles `unroll` slots. It first loads all their graph
-  // entries and only then tests them, so that the loads are independent of each other. `unroll` is
+  // entries, then (when filter_words is given) all their bitset words, and only then tests them,
+  // so that the loads of each step are independent of each other. `unroll` is
   // kSlotsPerRound / blockDim.x, limited to the range [1, kMaxUnroll]: the thread block handles
   // kSlotsPerRound slots per round, or one slot per thread when it has more than kSlotsPerRound
   // threads.
@@ -206,8 +240,18 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_passing_child_nodes_jit(
                               ? knn_graph[(s % knn_k) + (static_cast<int64_t>(knn_k) * bridge)]
                               : invalid_index;
     }
-    for (uint32_t u = 0; u < kMaxUnroll; u++) {
-      if (child[u] != invalid_index && passes(child[u])) { take(child[u]); }
+    if (filter_words != nullptr) {
+      uint32_t word[kMaxUnroll];
+      for (uint32_t u = 0; u < kMaxUnroll; u++) {
+        word[u] = (child[u] != invalid_index) ? filter_words[child[u] >> 5] : 0u;
+      }
+      for (uint32_t u = 0; u < kMaxUnroll; u++) {
+        if ((word[u] >> (child[u] & 31u)) & 1u) { take(child[u]); }
+      }
+    } else {
+      for (uint32_t u = 0; u < kMaxUnroll; u++) {
+        if (child[u] != invalid_index && passes(child[u])) { take(child[u]); }
+      }
     }
   }
   __syncthreads();
@@ -312,11 +356,23 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
   const bool passing_two_hop =
     (filter_payload.flags & kCagraFilterPassingTwoHop) != 0 && seed_ptr == nullptr;
 
-  // Whether a node passes the filter: the extern sample_filter function (linked via JIT LTO).
+  // Filter setup (see the kCagraFilter* flags in cagra_filter_payload.cuh):
+  //   - kCagraFilterBitsetWords: filter_words is the bitset of the filter object.
+  //   - otherwise:               filter_words is null and `passes` calls the linked sample_filter.
+  const uint32_t* filter_words = nullptr;
+  if (filter_payload.flags & kCagraFilterBitsetWords) {
+    filter_words = static_cast<const BitsetT*>(filter_payload.filter_data)->bitset_ptr;
+  }
   auto passes = [&](const INDEX_T node) -> bool {
+    const auto source = to_source_index(node);
+    if (filter_words != nullptr) { return (filter_words[source >> 5] >> (source & 31u)) & 1u; }
     return sample_filter<SourceIndexT>(
-      query_id + query_id_offset, to_source_index(node), filter_payload.sample_filter_data());
+      query_id + query_id_offset, source, filter_payload.sample_filter_data());
   };
+  // filter_words is indexed by source index. It can be indexed by graph node id only when the
+  // two are identical, i.e. when there is no source index mapping (source_indices_ptr == nullptr).
+  const uint32_t* const node_filter_words =
+    (source_indices_ptr == nullptr) ? filter_words : nullptr;
 
 #ifdef _CLK_BREAKDOWN
   uint64_t clk_init                 = 0;
@@ -399,6 +455,7 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
       block_id,
       num_blocks,
       graph_size > 0 ? graph_size : smem_desc->size,
+      node_filter_words,
       passes);
   } else {
     compute_distance_to_random_nodes_jit<IndexT, DistanceT, DataT>(result_indices_buffer,
@@ -516,6 +573,7 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
         result_position,
         static_cast<int>(itopk_size),
         static_cast<int>(result_buffer_size_32),
+        node_filter_words,
         passes);
     } else {
       compute_distance_to_child_nodes_jit<IndexT, DistanceT, DataT, 0>(result_indices_buffer,
