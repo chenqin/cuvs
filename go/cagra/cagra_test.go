@@ -331,4 +331,81 @@ func TestCagraFiltering(t *testing.T) {
 			t.Error("with filter: distance should be close to 0 for filtered query, got", distancesSlice[i][0])
 		}
 	}
+
+	// Step 4: Search points 516-519 with filter and the PASSING_TWO_HOP filter expansion - they
+	// should find themselves and no filtered-out point
+	queries3, err := cuvs.NewTensor(testDataset[(nFilteredOut + nQueries):(nFilteredOut + 2*nQueries)])
+	if err != nil {
+		t.Fatalf("error creating queries3 tensor: %v", err)
+	}
+	defer queries3.Close()
+
+	TwoHopSearchParams, err := CreateSearchParams()
+	if err != nil {
+		t.Fatalf("error creating two-hop search params: %v", err)
+	}
+	defer TwoHopSearchParams.Close()
+
+	if _, err := TwoHopSearchParams.SetAlgo(SearchAlgoMultiCta); err != nil {
+		t.Fatalf("error setting algo: %v", err)
+	}
+
+	if _, err := TwoHopSearchParams.SetFilterExpansion(FilterExpansionPassingTwoHop); err != nil {
+		t.Fatalf("error setting filter expansion: %v", err)
+	}
+
+	if _, err := queries3.ToDevice(&resource); err != nil {
+		t.Fatalf("error moving queries3 to device: %v", err)
+	}
+
+	if _, err := neighbors.ToDevice(&resource); err != nil {
+		t.Fatalf("error moving neighbors back to device: %v", err)
+	}
+
+	if _, err := distances.ToDevice(&resource); err != nil {
+		t.Fatalf("error moving distances back to device: %v", err)
+	}
+
+	err = SearchIndex(resource, TwoHopSearchParams, index, &queries3, &neighbors, &distances, allowList)
+	if err != nil {
+		t.Fatalf("error searching index with filter and two-hop expansion: %v", err)
+	}
+
+	if _, err := neighbors.ToHost(&resource); err != nil {
+		t.Fatalf("error moving neighbors to host: %v", err)
+	}
+
+	if _, err := distances.ToHost(&resource); err != nil {
+		t.Fatalf("error moving distances to host: %v", err)
+	}
+
+	if err := resource.Sync(); err != nil {
+		t.Fatalf("error syncing resource: %v", err)
+	}
+
+	neighborsSlice, err = neighbors.Slice()
+	if err != nil {
+		t.Fatalf("error getting neighbors slice: %v", err)
+	}
+
+	distancesSlice, err = distances.Slice()
+	if err != nil {
+		t.Fatalf("error getting distances slice: %v", err)
+	}
+
+	// Verify points 516-519 find themselves and only points of the second half are returned
+	for i := range neighborsSlice {
+		expectedID := uint32(i + nFilteredOut + nQueries)
+		if neighborsSlice[i][0] != expectedID {
+			t.Error("two-hop: wrong neighbor for filtered query, expected", expectedID, "got", neighborsSlice[i][0])
+		}
+		if distancesSlice[i][0] >= epsilon || distancesSlice[i][0] <= -epsilon {
+			t.Error("two-hop: distance should be close to 0 for filtered query, got", distancesSlice[i][0])
+		}
+		for j := range neighborsSlice[i] {
+			if neighborsSlice[i][j] < uint32(nFilteredOut) || neighborsSlice[i][j] >= uint32(nDataPoints) {
+				t.Error("two-hop: found point outside the allow list:", neighborsSlice[i][j])
+			}
+		}
+	}
 }
