@@ -31,6 +31,7 @@
 #include <raft/util/cuda_rt_essentials.hpp>
 #include <raft/util/cudart_utils.hpp>  // RAFT_CUDA_TRY_NOT_THROW is used TODO(tfeher): consider moving this to cuda_rt_essentials.hpp
 
+#include <raft/core/resource/device_memory_resource.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <algorithm>
@@ -107,9 +108,12 @@ struct search
          int64_t graph_degree,
          uint32_t topk)
     : base_type(res, params, dataset_desc, dim, dataset_size, graph_degree, topk),
-      intermediate_indices(0, raft::resource::get_cuda_stream(res)),
-      intermediate_distances(0, raft::resource::get_cuda_stream(res)),
-      topk_workspace(0, raft::resource::get_cuda_stream(res))
+      intermediate_indices(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      intermediate_distances(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      topk_workspace(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res))
   {
     set_params(res, params);
   }
