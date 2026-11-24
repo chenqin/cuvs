@@ -82,6 +82,7 @@ let params = SearchParams::builder().itopk_size(128).build()?;
 | Name | Source |
 | --- | --- |
 | `new` | `rust/cuvs/src/neighbors/cagra/params.rs:233` |
+| `set_query_bitsets` | `rust/cuvs/src/neighbors/cagra/params.rs:436` |
 
 ### new
 
@@ -105,10 +106,53 @@ rand_xor_mask: Option<u64>,
 persistent: Option<bool>,
 persistent_lifetime: Option<f32>,
 persistent_device_usage: Option<f32>,
+filtering_rate: Option<f32>,
+filter_expansion: Option<FilterExpansion>,
 ) -> Result<Self, CagraError>
 ```
 
 _Source: `rust/cuvs/src/neighbors/cagra/params.rs:233`_
+
+### set_query_bitsets
+
+```rust
+pub unsafe fn set_query_bitsets(&mut self, bitsets: *const *const u32)
+```
+
+Sets per-query filter bitsets for [`SearchAlgo::MultiCta`] search. Not
+used when null (default).
+
+When not null, `bitsets` is the device address of an array with one
+pointer per query of the search call. Each pointer is the device
+address of the 32-bit words of the bitset for that query, with one bit
+per row of the index: row `i` passes the filter when bit `i % 32` of
+word `i / 32` is set. A null pointer in the array leaves that query
+unfiltered. The bitset of the [`Filter`](super::Filter) passed to the
+search is not read, so queries with different filters can share one
+search call.
+
+The search must be given a [`Filter`](super::Filter), as in
+[`Index::search_filtered`](super::Index::search_filtered). `algo` must
+be [`SearchAlgo::MultiCta`] or [`SearchAlgo::Auto`] (it defaults to
+[`SearchAlgo::SingleCta`]); [`SearchAlgo::Auto`] selects
+[`SearchAlgo::MultiCta`] unless `persistent` is set, and the search
+fails with any other algorithm. With [`FilterExpansion::ScoreAll`],
+`filtering_rate` must be given, because it is not calculated from
+per-query bitsets. [`FilterExpansion::PassingTwoHop`] does not use it.
+
+#### Safety
+
+The address is stored as given and read by every search run with these
+parameters until it is replaced or reset to null. For each such search,
+the caller must guarantee that:
+- `bitsets` is the address, on the device that the search runs on, of
+an array with one pointer per query;
+- each of those pointers is null or the address, on the same device, of
+the 32-bit words of a bitset that covers every row of the index;
+- the array and the bitsets remain valid until the work that the search
+submits to the CUDA stream has completed.
+
+_Source: `rust/cuvs/src/neighbors/cagra/params.rs:436`_
 
 _Source: `rust/cuvs/src/neighbors/cagra/params.rs:225`_
 
