@@ -31,9 +31,12 @@
 namespace cuvs::neighbors::cagra::detail::multi_cta_search {
 
 // Host: set the kCagraFilter* flags of `payload` (see cagra_filter_payload.cuh) from the search
-// parameters:
+// parameters and the type of the filter that `sample_filter` wraps:
 //   - kCagraFilterPassingTwoHop: `ps.filter_expansion` is PASSING_TWO_HOP, with any filter type.
-// With the default search parameters no flag is set.
+//   - kCagraFilterBitsetWords:   PASSING_TWO_HOP with a bitset_filter whose bitset is not null and
+//                                uses standard 32-bit packing.
+// With the default search parameters no flag is set, and the kernel filters with the linked
+// sample_filter only.
 template <typename SourceIndexT, typename SampleFilterT>
 void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
                                 const SampleFilterT& sample_filter,
@@ -43,11 +46,23 @@ void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
                   sample_filter.filter;
                   sample_filter.offset;
                 }) {
-    // The search plan has already set itopk_size and sized the visited hash table and the shared
-    // memory from `ps.filter_expansion`, so the kernel has to run in the same mode.
-    if (ps.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
-      payload.flags |= kCagraFilterPassingTwoHop;
+    using inner_t      = std::decay_t<decltype(sample_filter.filter)>;
+    const bool two_hop = ps.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP;
+    if constexpr (is_bitset_filter<inner_t>::value) {
+      const auto view = sample_filter.filter.view();
+      // The kernel tests bit `i % 32` of word `i / 32`, which matches bitset_view::test() only
+      // for standard 32-bit packing (32-bit elements, original_nbits 0 or 32).
+      const bool standard_packing =
+        sizeof(*view.data()) == sizeof(uint32_t) &&
+        (view.get_original_nbits() == 0 || view.get_original_nbits() == 32);
+      if (two_hop && standard_packing && payload.filter_data != nullptr && view.data() != nullptr) {
+        payload.flags |= kCagraFilterBitsetWords;
+      }
     }
+    // The flag is set for every filter type, not only for bitsets: the search plan has already
+    // set itopk_size and sized the visited hash table and the shared memory from
+    // `ps.filter_expansion`, so the kernel has to run in the same mode.
+    if (two_hop) { payload.flags |= kCagraFilterPassingTwoHop; }
   }
 }
 

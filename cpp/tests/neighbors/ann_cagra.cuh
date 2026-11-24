@@ -2171,10 +2171,11 @@ inline std::vector<AnnCagraInputs> generate_filtering_inputs()
   inputs.insert(inputs.end(), inputs2.begin(), inputs2.end());
 
   // PASSING_TWO_HOP on MULTI_CTA, the only algorithm that implements it. AnnCagraFilterTest
-  // searches each input with a bitset filter and with a bloom filter. The inputs sample the dims,
-  // graph degrees and metrics of the two blocks above instead of crossing them, to limit the
-  // number of index builds. use_source_indices = true covers an index with source indices, for
-  // which the filter is tested by source index. min_recall is the value the two blocks above use.
+  // searches each input with a bitset filter, whose words the kernel reads directly, and with a
+  // bloom filter, for which the kernel calls the linked filter. The inputs sample the dims, graph
+  // degrees and metrics of the two blocks above instead of crossing them, to limit the number of
+  // index builds. use_source_indices = true covers an index with source indices, for which the
+  // filter is tested by source index. min_recall is the value the two blocks above use.
   for (auto [dim, graph_degree, metric, use_source_indices] :
        std::vector<std::tuple<int, int, cuvs::distance::DistanceType, bool>>{
          {1, 32, cuvs::distance::DistanceType::L2Expanded, false},
