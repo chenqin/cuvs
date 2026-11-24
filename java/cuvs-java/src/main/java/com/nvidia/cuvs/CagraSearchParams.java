@@ -88,22 +88,43 @@ public class CagraSearchParams {
   }
 
   /**
-   * Enum to denote how a MULTI_CTA search walks the graph when a prefilter is
-   * given.
+   * Enum to denote how a filtered CAGRA search traverses the graph.
+   *
+   * <p>{@link #PASSING_TWO_HOP} is intended for filters that pass a small
+   * fraction of the dataset, where {@link #SCORE_ALL} computes most distances
+   * for nodes that are filtered out. The search only moves between nodes that
+   * pass the filter and are at most two hops apart in the graph, so
+   * {@link #PASSING_TWO_HOP} is effective when the rows that pass the filter
+   * are close to each other in the graph. When fewer than roughly one row in
+   * {@code graphDegree * graphDegree} passes the filter, or the rows that pass
+   * are spread uniformly over the dataset at a low rate, the search cannot move
+   * beyond its initial random seed nodes. Use {@link #SCORE_ALL} or an exact
+   * search ({@link BruteForceIndex} with a prefilter) for such filters.
+   *
+   * <p>Only the MULTI_CTA search algorithm implements {@link #PASSING_TWO_HOP}.
+   * {@link MultiPartitionCagraSearch} always uses {@link #SCORE_ALL}.
    */
   public enum FilterExpansion {
     /**
-     * Every neighbor of an expanded node is scored and may be expanded in turn,
-     * whether or not it passes the filter; rejected nodes are dropped from the
-     * results.
+     * The distance is computed for every neighbor of a parent node, whether or
+     * not it passes the filter, and a filtered-out node can be selected as a
+     * parent node. Filtered-out nodes are removed from the search results. The
+     * MULTI_CTA algorithm increases the itopk size according to the filtering
+     * rate to compensate for the filtered-out nodes in the itopk list.
      */
     SCORE_ALL(0),
     /**
-     * Only nodes that pass the filter are scored, kept and expanded. A rejected
-     * neighbor is not scored: its own neighbors are examined instead. The search
-     * starts from random nodes that pass the filter (as many per start slot as
-     * the number of random samplings, the nearest kept). For filters that reject
-     * most of the index.
+     * The distance is computed only for nodes that pass the filter, and only
+     * these nodes enter the itopk list and are selected as parent nodes. The
+     * child nodes of a parent node are its neighbors that pass the filter and,
+     * for each neighbor that is filtered out (a bridge), the neighbors of the
+     * bridge that pass the filter, up to the child capacity of the result
+     * buffer (about the graph degree). The initial random seed nodes are random
+     * nodes that pass the filter, each the nearest of as many such nodes as the
+     * number of random samplings (see
+     * {@link Builder#withNumRandomSamplings(int)}). The itopk size is not
+     * increased according to the filtering rate, and the filtering rate of the
+     * prefilter is not computed.
      */
     PASSING_TWO_HOP(1);
 
@@ -139,9 +160,9 @@ public class CagraSearchParams {
    *                           node selection
    * @param randXORMask        the bit mask used for initial random seed node
    *                           selection
-   * @param filteringRate      the fraction of the index's rows that the filter
-   *                           removes
-   * @param filterExpansion    how a filtered MULTI_CTA search walks the graph
+   * @param filteringRate      the rate of nodes to be filtered-out, when
+   *                           filtering is used
+   * @param filterExpansion    how a filtered search traverses the graph
    * @param queryBitsets       the device address of an array with one bitset
    *                           pointer per query
    */
@@ -299,17 +320,16 @@ public class CagraSearchParams {
   }
 
   /**
-   * Gets the fraction of the index's rows that the filter removes.
+   * Gets the rate of nodes to be filtered-out, when filtering is used.
    *
-   * @return the filtering rate, or 0 when each search computes it from the
-   *         prefilter
+   * @return the filtering rate, or 0 when it is automatically calculated
    */
   public float getFilteringRate() {
     return filteringRate;
   }
 
   /**
-   * Gets how a filtered MULTI_CTA search walks the graph.
+   * Gets how a filtered search traverses the graph.
    *
    * @return the configured {@link FilterExpansion}
    */
@@ -542,13 +562,17 @@ public class CagraSearchParams {
     }
 
     /**
-     * Sets the fraction of the index's rows that the filter removes. More than
-     * 0, less than 1. When 0 (the default), it is computed from the prefilter by
-     * each search that needs it, which reads the whole bitset and waits for the
-     * result.
+     * Sets the rate of nodes to be filtered-out, when filtering is used.
      *
-     * @param filteringRate the fraction of the index's rows that the filter
-     *                      removes
+     * <p>The value must be greater than 0.0 and less than 1.0. When set to 0
+     * (default), the filtering rate is automatically calculated: each
+     * {@link CagraIndex} search with a prefilter then counts the bits of the
+     * prefilter and waits for the result, unless the filter expansion is
+     * {@link FilterExpansion#PASSING_TWO_HOP}, which does not use the rate.
+     * {@link MultiPartitionCagraSearch} then counts the bits of the partition
+     * filters in every call.
+     *
+     * @param filteringRate the rate of nodes to be filtered-out
      * @return an instance of this Builder
      */
     public Builder withFilteringRate(float filteringRate) {
@@ -557,10 +581,15 @@ public class CagraSearchParams {
     }
 
     /**
-     * Sets how a filtered MULTI_CTA search walks the graph. With
-     * {@link FilterExpansion#PASSING_TWO_HOP}, {@link SearchAlgo#AUTO} selects
-     * MULTI_CTA. Other algorithms ignore it, and so does
-     * {@link MultiPartitionCagraSearch}.
+     * Sets how a filtered search traverses the graph (see
+     * {@link FilterExpansion}). Default: {@link FilterExpansion#SCORE_ALL}.
+     *
+     * <p>{@link FilterExpansion#PASSING_TWO_HOP} is implemented by the
+     * MULTI_CTA algorithm only. It selects MULTI_CTA when the search algorithm
+     * is {@link SearchAlgo#AUTO}. The other algorithms ignore it and log a
+     * warning. {@link MultiPartitionCagraSearch} always uses
+     * {@link FilterExpansion#SCORE_ALL}. The value has no effect on a search
+     * without a prefilter.
      *
      * @param filterExpansion the {@link FilterExpansion} to use
      * @return an instance of this Builder
@@ -571,24 +600,30 @@ public class CagraSearchParams {
     }
 
     /**
-     * Sets one bitset per query for a filtered MULTI_CTA search. No per-query
-     * bitsets when 0 (the default). Otherwise the device address of an array
-     * with one pointer per query, each to the 32-bit words of that query's own
-     * bitset over the index's rows (bit {@code i % 32} of word {@code i / 32} is
-     * set when row {@code i} passes), on the device being searched. A null
-     * pointer leaves that query unfiltered.
-     * <p>
-     * The query must still be given a prefilter with
-     * {@link CagraQuery.Builder#withPrefilter}. Its bitset is then not read, so
-     * queries with different filters can share one search call. The filtering
-     * rate must be set unless the filter expansion is
-     * {@link FilterExpansion#PASSING_TWO_HOP}, and the search algorithm must be
-     * {@link SearchAlgo#MULTI_CTA} or {@link SearchAlgo#AUTO}, which then selects
-     * MULTI_CTA.
-     * {@link MultiPartitionCagraSearch} does not take per-query bitsets.
-     * <p>
-     * The array and the bitsets are not copied: they must stay valid until the
-     * search's work on the CUDA stream has finished.
+     * Sets per-query filter bitsets for MULTI_CTA search. Not used when 0
+     * (default).
+     *
+     * <p>When not 0, this is the device address of an array with one pointer
+     * per query of the search call. Each pointer is the device address of the
+     * 32-bit words of the bitset for that query, with one bit per row of the
+     * index: row {@code i} passes the filter when bit {@code i % 32} of word
+     * {@code i / 32} is set. A null pointer leaves that query unfiltered. The
+     * bitset of the prefilter given to the query is not read, so queries with
+     * different filters can share one search call.
+     *
+     * <p>The query must be given a prefilter with
+     * {@link CagraQuery.Builder#withPrefilter}. The search algorithm must be
+     * {@link SearchAlgo#MULTI_CTA} or {@link SearchAlgo#AUTO}, which then
+     * selects MULTI_CTA; the search fails with any other algorithm. With
+     * {@link FilterExpansion#SCORE_ALL}, the filtering rate must be greater
+     * than 0, because it is not calculated from per-query bitsets.
+     * {@link FilterExpansion#PASSING_TWO_HOP} does not use it.
+     * {@link MultiPartitionCagraSearch} and {@link TieredIndex} do not support
+     * per-query bitsets and fail when this value is not 0.
+     *
+     * <p>The array and the bitsets are not copied: they must reside on the
+     * device that the search runs on and must remain valid until the work that
+     * the search submits to the CUDA stream has completed.
      *
      * @param queryBitsets the device address of an array with one bitset pointer
      *                     per query, or 0 for none

@@ -688,49 +688,81 @@ cdef class SearchParams:
     persistent_device_usage : float
         Sets the fraction of maximum grid size used by persistent kernel.
     filtering_rate: float, optional
-        Fraction of the index's rows the filter removes, greater than 0
-        and less than 1. When not given, it is computed from the filter by
-        each search that needs it, which reads the whole bitset and waits
-        for the result.
+        A parameter indicating the rate of nodes to be filtered-out, when
+        filtering is used. The value must be greater than 0.0 and less than
+        1.0. When not given, the filtering rate is automatically calculated
+        when possible. For a bitset filter, each search call then counts
+        the bits of the bitset and waits for the result, unless
+        filter_expansion is "passing_two_hop", which does not use the rate.
     filter_expansion: str, default = "score_all"
-        String denoting how a filtered multi_cta search walks the graph.
-        With "passing_two_hop", algo "auto" selects multi_cta. Other
-        algorithms ignore it.
+        String denoting how a filtered search traverses the graph.
         Valid values for filter_expansion: ["score_all",
         "passing_two_hop"], where:
 
-            - score_all scores every neighbor of an expanded node, and may
-              expand it in turn, whether or not it passes the filter.
-              Rejected nodes are dropped from the results.
-            - passing_two_hop scores, keeps and expands only the nodes that
-              pass the filter. A rejected neighbor is not scored: its own
-              neighbors are examined instead. The search starts from random
-              nodes that pass the filter (num_random_samplings of them per
-              start slot, the nearest kept). This suits filters that reject
-              most of the index, and is most effective when the rows a
-              filter passes are near each other. The walk cannot leave its
-              start nodes when the passing rows are too few for any to lie
-              within two hops of one another (under roughly one row in the
-              square of the graph degree).
+            - score_all computes the distance for every neighbor of a
+              parent node, whether or not it passes the filter, and a
+              filtered-out node can be selected as a parent node.
+              Filtered-out nodes are removed from the search results. The
+              multi_cta algorithm increases itopk_size according to
+              filtering_rate to compensate for the filtered-out nodes in
+              the itopk list.
+            - passing_two_hop computes the distance only for nodes that
+              pass the filter, and only these nodes enter the itopk list
+              and are selected as parent nodes. The child nodes of a parent
+              node are its neighbors that pass the filter and, for each
+              neighbor that is filtered out (a bridge), the neighbors of
+              the bridge that pass the filter, up to the child capacity of
+              the result buffer (about graph_degree nodes). The initial
+              random seed nodes are random nodes that pass the filter, each
+              the nearest of num_random_samplings such nodes. itopk_size is
+              not increased according to filtering_rate, and the filtering
+              rate of a bitset filter is not computed.
+
+        passing_two_hop is intended for filters that pass a small fraction
+        of the dataset, where score_all computes most distances for nodes
+        that are filtered out. The search only moves between nodes that
+        pass the filter and are at most two hops apart in the graph, so
+        passing_two_hop is effective when the rows that pass the filter are
+        close to each other in the graph. When fewer than roughly one row
+        in `graph_degree * graph_degree` passes the filter, or the rows
+        that pass are spread uniformly over the dataset at a low rate, the
+        search cannot move beyond its initial random seed nodes. Use
+        score_all or an exact search (cuvs.neighbors.brute_force.search
+        with a bitset prefilter) for such filters.
+
+        passing_two_hop is implemented by the multi_cta algorithm only. It
+        selects multi_cta when algo is "auto", unless persistent is set.
+        The other algorithms ignore it and log a warning. The value has no
+        effect on a search without a filter.
 
     query_bitsets: int or CUDA array interface compliant array, optional
-        One bitset per query, for a multi_cta search with a bitset filter
-        (see cuvs.neighbors.filters.from_bitset). Either the device address
-        of an array with one pointer per query, or a one-dimensional device
-        array of dtype uint64 that holds those pointers, for example a
-        cupy array. Each pointer is the device address of the uint32 words
-        of that query's own bitset over the index's rows: bit `i % 32` of
-        word `i // 32` is set when row `i` passes. The array and the bitsets
-        are on the device being searched. The bitset of the filter passed
-        to the search is then not read, so queries with different filters
-        can share one search call. A null pointer leaves that query
-        unfiltered. `filtering_rate` must be given unless `filter_expansion`
-        is "passing_two_hop", and `algo` must be "multi_cta" or "auto",
-        which then selects it. Tiered index search does not take it.
+        Per-query filter bitsets for multi_cta search. Either the device
+        address of an array with one pointer per query of the search call,
+        or a one-dimensional device array of dtype uint64 that holds those
+        pointers, for example a cupy array. Each pointer is the device
+        address of the uint32 words of the bitset for that query, with one
+        bit per row of the index: row `i` passes the filter when bit
+        `i % 32` of word `i // 32` is set. A null pointer leaves that query
+        unfiltered. The bitset of the filter passed to the search is not
+        read, so queries with different filters can share one search call.
 
-        The pointer array and the bitsets must stay valid until the search
-        has finished: until `search` returns or, when a `resources` object
-        is passed to it, until `resources.sync()` has been called. An array
+        Requirements:
+
+            - The filter passed to the search must be a bitset filter (see
+              cuvs.neighbors.filters.from_bitset).
+            - algo must be "multi_cta" or "auto". "auto" selects multi_cta
+              unless persistent is set. The search fails with any other
+              algorithm.
+            - With "score_all", filtering_rate must be given, because it is
+              not calculated from per-query bitsets. "passing_two_hop" does
+              not use it.
+            - Tiered index search does not support per-query bitsets and
+              fails when they are given.
+
+        The pointer array and the bitsets must reside on the device that
+        the search runs on and must remain valid until the search has
+        completed: until `search` returns or, when a `resources` object is
+        passed to it, until `resources.sync()` has been called. An array
         given here is kept alive by this object. The bitsets it points to,
         and an array given by its address, are not.
 
@@ -830,7 +862,9 @@ cdef class SearchParams:
                         "team_size", "search_width", "min_iterations",
                         "thread_block_size", "hashmap_mode",
                         "hashmap_min_bitlen", "hashmap_max_fill_rate",
-                        "num_random_samplings", "rand_xor_mask"]]
+                        "num_random_samplings", "rand_xor_mask",
+                        "filtering_rate", "filter_expansion",
+                        "query_bitsets"]]
         return "SearchParams(type=CAGRA, " + (", ".join(attr_str)) + ")"
 
     def get_handle(self):

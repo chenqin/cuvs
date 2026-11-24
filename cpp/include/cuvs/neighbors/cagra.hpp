@@ -54,29 +54,37 @@ enum class hash_mode { HASH = 0, SMALL = 1, AUTO = 100 };
 enum class internal_dtype { F16 = 0, E5M2 = 1 };
 
 /**
- * How a MULTI_CTA search walks the graph when a sample filter is given.
+ * @brief How a filtered CAGRA search traverses the graph
+ *
+ * - `SCORE_ALL`: The distance is computed for every neighbor of a parent node, whether or not it
+ * passes the filter, and a filtered-out node can be selected as a parent node. Filtered-out nodes
+ * are removed from the search results. The MULTI_CTA algorithm increases `itopk_size` according to
+ * `filtering_rate` to compensate for the filtered-out nodes in the itopk list.
+ * - `PASSING_TWO_HOP`: The distance is computed only for nodes that pass the filter, and only
+ * these nodes enter the itopk list and are selected as parent nodes. The child nodes of a parent
+ * node are its neighbors that pass the filter and, for each neighbor that is filtered out (a
+ * bridge), the neighbors of the bridge that pass the filter, up to the child capacity of the
+ * result buffer (about `graph_degree` nodes). The initial random seed nodes are random nodes that
+ * pass the filter, each the nearest of `num_random_samplings` such nodes. `itopk_size` is not
+ * increased according to `filtering_rate`, and the filtering rate of a `filtering::bitset_filter`
+ * is not computed.
+ *
+ * `PASSING_TWO_HOP` is intended for filters that pass a small fraction of the dataset, where
+ * `SCORE_ALL` computes most distances for nodes that are filtered out. The search only moves
+ * between nodes that pass the filter and are at most two hops apart in the graph, so
+ * `PASSING_TWO_HOP` is effective when the rows that pass the filter are close to each other in the
+ * graph. When fewer than roughly one row in `graph_degree * graph_degree` passes the filter, or
+ * the rows that pass are spread uniformly over the dataset at a low rate, the search cannot move
+ * beyond its initial random seed nodes. Use `SCORE_ALL` or an exact search (`brute_force::search`
+ * with a bitset filter) for such filters.
+ *
+ * Only the MULTI_CTA search algorithm implements `PASSING_TWO_HOP`. Multi-partition search always
+ * uses `SCORE_ALL`.
  */
 enum class filter_expansion_mode {
-  /**
-   * Every neighbor of an expanded node is scored and may be expanded in turn, whether or not it
-   * passes the filter; rejected nodes are dropped from the results. The candidate list is
-   * lengthened by the filtering rate to make up for the rejected nodes it holds.
-   */
+  /** Compute the distance to every neighbor of a parent node; remove filtered-out nodes. */
   SCORE_ALL = 0,
-  /**
-   * Only nodes that pass the filter are scored, kept and expanded. A rejected neighbor is not
-   * scored: its own neighbors are examined instead, so a node's children are its passing
-   * neighbors and the passing neighbors of its rejected neighbors, up to about the graph degree
-   * of them per expansion. The search starts from random nodes that pass the filter
-   * (`num_random_samplings` of them per start slot, the nearest kept), and the candidate list is
-   * not lengthened by the filtering rate, which is not needed and not computed.
-   *
-   * This suits filters that reject most of the index, where SCORE_ALL spends nearly all its
-   * distance computations on nodes it then drops, and is most effective when the rows a filter
-   * passes are near each other. With too few passing rows for any to lie within two hops of one
-   * another (under roughly one row in the square of the graph degree), the walk cannot leave its
-   * start nodes; scan the passing rows instead. Multi-partition search ignores this mode.
-   */
+  /** Compute the distance only to nodes that pass the filter, reached through up to two hops. */
   PASSING_TWO_HOP = 1
 };
 
@@ -158,22 +166,36 @@ struct search_params : cuvs::neighbors::search_params {
   float filtering_rate = -1.0;
 
   /**
-   * How a filtered MULTI_CTA search walks the graph. PASSING_TWO_HOP selects MULTI_CTA when `algo`
-   * is AUTO; the other algorithms ignore it, with a warning.
+   * How a filtered search traverses the graph (see `filter_expansion_mode`).
+   *
+   * `PASSING_TWO_HOP` is implemented by the MULTI_CTA algorithm only. It selects MULTI_CTA when
+   * `algo` is AUTO, unless `persistent` is set. The other algorithms ignore it and log a warning.
+   * Multi-partition search always uses `SCORE_ALL`. The value has no effect on a search without a
+   * filter.
    */
   filter_expansion_mode filter_expansion = filter_expansion_mode::SCORE_ALL;
 
   /**
-   * MULTI_CTA with a `filtering::bitset_filter`: when not null, a device array with one pointer
-   * per query, each to the 32-bit words of that query's own bitset over the index's rows (bit
-   * `i % 32` of word `i / 32` is set when row `i` passes), on the device being searched. The
-   * bitset of the filter object is then not read, so queries with different filters can share one
-   * search call. A null pointer leaves that query unfiltered. The array must hold a pointer for
-   * every query of the call. `filtering_rate` must be given unless `filter_expansion` is
-   * PASSING_TWO_HOP, which does not use it. It selects MULTI_CTA when `algo` is AUTO, and the
-   * search fails with any other algorithm. Multi-partition search, tiered-index search and
-   * dynamic batching do not take it. The array and the bitsets must stay valid until the search's
-   * work on the stream has finished.
+   * Per-query filter bitsets for MULTI_CTA search. Not used when null (default).
+   *
+   * When not null, this is a device array with one pointer per query of the search call. Each
+   * pointer is the device address of the 32-bit words of the bitset for that query, with one bit
+   * per row of the index: row `i` passes the filter when bit `i % 32` of word `i / 32` is set. A
+   * null pointer leaves that query unfiltered. The bitset of the filter object passed to the
+   * search is not read, so queries with different filters can share one search call.
+   *
+   * Requirements:
+   *   - The filter passed to the search must be a `filtering::bitset_filter` with standard 32-bit
+   *     packing.
+   *   - `algo` must be MULTI_CTA or AUTO. AUTO selects MULTI_CTA unless `persistent` is set. The
+   *     search fails with any other algorithm.
+   *   - With `SCORE_ALL`, `filtering_rate` must be given (not negative), because it is not
+   *     calculated from per-query bitsets. `PASSING_TWO_HOP` does not use it.
+   *   - Multi-partition search, tiered index search and dynamic batching do not support per-query
+   *     bitsets and fail when this pointer is not null.
+   *
+   * The array and the bitsets must reside on the device that the search runs on and must remain
+   * valid until the work that the search submits to the CUDA stream has completed.
    */
   const uint32_t* const* query_bitsets = nullptr;
 

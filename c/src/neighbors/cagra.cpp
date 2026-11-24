@@ -1501,7 +1501,8 @@ void convert_c_search_params(cuvsCagraSearchParams params,
   out->persistent            = params.persistent;
   out->persistent_lifetime   = params.persistent_lifetime;
   out->persistent_device_usage = params.persistent_device_usage;
-  // 0 or less selects the automatic rate, so a zeroed C struct asks for it.
+  // In the C API, 0 (the default) or a negative value selects the automatic calculation of the
+  // filtering rate. The C++ API uses a negative value for that.
   out->filtering_rate   = params.filtering_rate > 0.0f ? params.filtering_rate : -1.0f;
   out->filter_expansion =
     static_cast<cuvs::neighbors::cagra::filter_expansion_mode>(params.filter_expansion);

@@ -401,35 +401,38 @@ impl SearchParams {
         self.handle
     }
 
-    /// Gives each query of a filtered [`SearchAlgo::MultiCta`] search its own
-    /// bitset.
+    /// Sets per-query filter bitsets for [`SearchAlgo::MultiCta`] search. Not
+    /// used when null (default).
     ///
-    /// `bitsets` is the device address of an array with one pointer per query,
-    /// each to the 32-bit words of that query's own bitset over the index's
-    /// rows (bit `i % 32` of word `i / 32` is set when row `i` passes). A null
-    /// pointer in the array leaves that query unfiltered. The search must
-    /// still be given a [`Filter`](super::Filter), as in
-    /// [`Index::search_filtered`](super::Index::search_filtered); its own
-    /// bitset is then not read, so queries with different filters can share
-    /// one search call.
+    /// When not null, `bitsets` is the device address of an array with one
+    /// pointer per query of the search call. Each pointer is the device
+    /// address of the 32-bit words of the bitset for that query, with one bit
+    /// per row of the index: row `i` passes the filter when bit `i % 32` of
+    /// word `i / 32` is set. A null pointer in the array leaves that query
+    /// unfiltered. The bitset of the [`Filter`](super::Filter) passed to the
+    /// search is not read, so queries with different filters can share one
+    /// search call.
     ///
-    /// `algo` must be [`SearchAlgo::MultiCta`] or [`SearchAlgo::Auto`], which
-    /// then selects it, and `filtering_rate` must be given unless
-    /// `filter_expansion` is [`FilterExpansion::PassingTwoHop`]; the search
-    /// fails otherwise. A null `bitsets` goes back to filtering every query by
-    /// the filter's own bitset.
+    /// The search must be given a [`Filter`](super::Filter), as in
+    /// [`Index::search_filtered`](super::Index::search_filtered). `algo` must
+    /// be [`SearchAlgo::MultiCta`] or [`SearchAlgo::Auto`] (it defaults to
+    /// [`SearchAlgo::SingleCta`]); [`SearchAlgo::Auto`] selects
+    /// [`SearchAlgo::MultiCta`] unless `persistent` is set, and the search
+    /// fails with any other algorithm. With [`FilterExpansion::ScoreAll`],
+    /// `filtering_rate` must be given, because it is not calculated from
+    /// per-query bitsets. [`FilterExpansion::PassingTwoHop`] does not use it.
     ///
     /// # Safety
     ///
     /// The address is stored as given and read by every search run with these
     /// parameters until it is replaced or reset to null. For each such search,
     /// the caller must guarantee that:
-    /// - `bitsets` is the address, on the device being searched, of an array
-    ///   with one pointer per query;
+    /// - `bitsets` is the address, on the device that the search runs on, of
+    ///   an array with one pointer per query;
     /// - each of those pointers is null or the address, on the same device, of
     ///   the 32-bit words of a bitset that covers every row of the index;
-    /// - the array and the bitsets stay valid until the search's work on the
-    ///   stream has finished.
+    /// - the array and the bitsets remain valid until the work that the search
+    ///   submits to the CUDA stream has completed.
     pub unsafe fn set_query_bitsets(&mut self, bitsets: *const *const u32) {
         unsafe { (*self.handle).query_bitsets = bitsets as usize };
     }

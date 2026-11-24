@@ -136,22 +136,47 @@ impl From<ffi::cuvsCagraHashMode> for HashMode {
     }
 }
 
-/// How a filtered [`SearchAlgo::MultiCta`] search walks the graph.
+/// How a filtered CAGRA search traverses the graph.
 ///
-/// With [`FilterExpansion::PassingTwoHop`], [`SearchAlgo::Auto`] selects
-/// [`SearchAlgo::MultiCta`]. Other search algorithms ignore it.
+/// [`FilterExpansion::PassingTwoHop`] is intended for filters that pass a small
+/// fraction of the dataset, where [`FilterExpansion::ScoreAll`] computes most
+/// distances for nodes that are filtered out. The search only moves between
+/// nodes that pass the filter and are at most two hops apart in the graph, so
+/// [`FilterExpansion::PassingTwoHop`] is effective when the rows that pass the
+/// filter are close to each other in the graph. When fewer than roughly one
+/// row in `graph_degree * graph_degree` passes the filter, or the rows that
+/// pass are spread uniformly over the dataset at a low rate, the search cannot
+/// move beyond its initial random seed nodes. Use [`FilterExpansion::ScoreAll`]
+/// or an exact search ([`brute_force`](crate::neighbors::brute_force) with a
+/// bitset filter) for such filters.
+///
+/// [`FilterExpansion::PassingTwoHop`] is implemented by
+/// [`SearchAlgo::MultiCta`] only. It selects [`SearchAlgo::MultiCta`] when
+/// `algo` is [`SearchAlgo::Auto`], unless `persistent` is set. The other
+/// algorithms ignore it and log a warning. `algo` defaults to
+/// [`SearchAlgo::SingleCta`], so it must be set to [`SearchAlgo::MultiCta`]
+/// (or [`SearchAlgo::Auto`]) for [`FilterExpansion::PassingTwoHop`] to take
+/// effect. The value has no effect on a search without a filter.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FilterExpansion {
-    /// Score all -- every neighbor of an expanded node is scored and may be
-    /// expanded in turn, whether or not it passes the filter; rejected nodes
-    /// are dropped from the results. This is the default.
+    /// Score all -- the distance is computed for every neighbor of a parent
+    /// node, whether or not it passes the filter, and a filtered-out node can
+    /// be selected as a parent node. Filtered-out nodes are removed from the
+    /// search results. The [`SearchAlgo::MultiCta`] algorithm increases
+    /// `itopk_size` according to `filtering_rate` to compensate for the
+    /// filtered-out nodes in the itopk list. This is the default.
     ScoreAll,
-    /// Passing two-hop -- only nodes that pass the filter are scored, kept and
-    /// expanded. A rejected neighbor is not scored: its own neighbors are
-    /// examined instead. The search starts from random nodes that pass the
-    /// filter (`num_random_samplings` of them per start slot, the nearest
-    /// kept). Best for filters that reject most of the index.
+    /// Passing two-hop -- the distance is computed only for nodes that pass
+    /// the filter, and only these nodes enter the itopk list and are selected
+    /// as parent nodes. The child nodes of a parent node are its neighbors
+    /// that pass the filter and, for each neighbor that is filtered out (a
+    /// bridge), the neighbors of the bridge that pass the filter, up to the
+    /// child capacity of the result buffer (about `graph_degree` nodes). The
+    /// initial random seed nodes are random nodes that pass the filter, each
+    /// the nearest of `num_random_samplings` such nodes. `itopk_size` is not
+    /// increased according to `filtering_rate`, and the filtering rate of the
+    /// filter is not computed.
     PassingTwoHop,
 }
 
