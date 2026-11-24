@@ -199,7 +199,11 @@ struct search_plan_impl : public search_plan_impl_base {
 
   void adjust_search_params()
   {
-    if (algo == search_algo::MULTI_CTA && (0.0 < filtering_rate && filtering_rate < 1.0)) {
+    // Increase itopk_size to compensate for the filtered-out nodes in the itopk list. Not needed
+    // for PASSING_TWO_HOP, whose itopk list only holds nodes that pass the filter.
+    if (algo == search_algo::MULTI_CTA &&
+        filter_expansion != filter_expansion_mode::PASSING_TWO_HOP &&
+        (0.0 < filtering_rate && filtering_rate < 1.0)) {
       size_t adjusted_itopk_size =
         (size_t)((float)topk / (1.0 - filtering_rate) +
                  (float)(itopk_size - topk) / std::sqrt(1.0 - filtering_rate));
@@ -274,7 +278,17 @@ struct search_plan_impl : public search_plan_impl_base {
       // table that each CTA has in the shared memory. This hash table is not
       // shared among CTAs. This hash table is reset and restored in each iteration.
       //
-      const uint32_t max_visited_nodes       = mc_itopk_size + (graph_degree * 2);
+      // With PASSING_TWO_HOP, the second-hop child nodes are also registered in this table. The
+      // kernel checks whether the child part of the result buffer is full once per round of the
+      // second hop (see compute_distance_to_passing_child_nodes_jit), so child nodes can still be
+      // registered after it has become full. kTwoHopExtraVisitedNodes entries are added for them.
+      // The value is an empirical allowance: it is not derived from the number of graph entries
+      // that the kernel examines per round (kSlotsPerRound), and it is not an upper bound. When
+      // the table is full, the insertion fails and the kernel drops the child node.
+      constexpr uint32_t kTwoHopExtraVisitedNodes = 128;
+      const uint32_t max_visited_nodes =
+        mc_itopk_size + (graph_degree * 2) +
+        (filter_expansion == filter_expansion_mode::PASSING_TWO_HOP ? kTwoHopExtraVisitedNodes : 0);
       constexpr size_t max_small_hash_bitlen = 14;  // 16K
       small_hash_bitlen                      = 8;   // 256
       // Stop at the supported maximum rather than growing without bound: hashmap::get_size()
@@ -417,6 +431,11 @@ struct search_plan_impl : public search_plan_impl_base {
         thread_block_size != 256 && thread_block_size != 512 && thread_block_size != 1024) {
       error_message += "`thread_block_size` must be 0, 64, 128, 256 or 512. " +
                        std::to_string(thread_block_size) + " has been given.";
+    }
+    if (filter_expansion != filter_expansion_mode::SCORE_ALL &&
+        filter_expansion != filter_expansion_mode::PASSING_TWO_HOP) {
+      error_message += "An invalid filter expansion mode has been given: " +
+                       std::to_string(static_cast<int>(filter_expansion)) + "";
     }
     if (hashmap_min_bitlen > 20) {
       error_message += "`hashmap_min_bitlen` must be equal to or smaller than 20. " +

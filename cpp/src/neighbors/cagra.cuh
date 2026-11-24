@@ -444,6 +444,28 @@ inline float bitset_filtering_rate(
   return std::min(std::max(rate, 0.0f), 0.999f);
 }
 
+/**
+ * Resolve `params.algo` for a filtered search that uses PASSING_TWO_HOP, which is implemented by
+ * the MULTI_CTA search algorithm only.
+ *
+ * AUTO becomes MULTI_CTA unless `persistent` is set (search_plan_impl_base then selects
+ * SINGLE_CTA). If the algorithm is not MULTI_CTA after that, a warning is logged, because the
+ * other algorithms ignore PASSING_TWO_HOP.
+ */
+inline void resolve_filtered_search_algo(search_params& params)
+{
+  if (params.filter_expansion != filter_expansion_mode::PASSING_TWO_HOP) { return; }
+  if (params.algo == search_algo::AUTO && !params.persistent) {
+    params.algo = search_algo::MULTI_CTA;
+    RAFT_LOG_DEBUG("Auto strategy: PASSING_TWO_HOP set, selecting multi-cta");
+  } else if (params.algo != search_algo::MULTI_CTA) {
+    RAFT_LOG_WARN(
+      "CAGRA filter_expansion PASSING_TWO_HOP is only supported with MULTI_CTA search (algo=%d); "
+      "filter_expansion will have no effect",
+      static_cast<int>(params.algo));
+  }
+}
+
 template <typename T,
           typename IdxT,
           cuvs::neighbors::ann_dataset_view DatasetViewT,
@@ -461,6 +483,10 @@ void search(raft::resources const& res,
     auto& sample_filter       = dynamic_cast<const none_filter_type&>(sample_filter_ref);
     search_params params_copy = params;
     if (params.filtering_rate < 0.0) { params_copy.filtering_rate = 0.0; }
+    // PASSING_TWO_HOP applies to filtered searches only. Reset it so that an unfiltered search is
+    // planned and run as SCORE_ALL.
+    params_copy.filter_expansion = filter_expansion_mode::SCORE_ALL;
+
     auto sample_filter_copy = sample_filter;
     return search_with_filtering<T, IdxT, none_filter_type, OutputIdxT, DatasetViewT>(
       res, params_copy, idx, queries, neighbors, distances, sample_filter_copy);
@@ -472,9 +498,16 @@ void search(raft::resources const& res,
       dynamic_cast<const cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>&>(
         sample_filter_ref);
     search_params params_copy = params;
+    resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0) {
-      params_copy.filtering_rate = bitset_filtering_rate(
-        res, {static_cast<int64_t>(idx.dataset().n_rows())}, {sample_filter.bitset_view_});
+      if (params.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
+        // PASSING_TWO_HOP does not use the filtering rate (itopk_size is increased by it only
+        // for SCORE_ALL), so the bits of the filter are not counted.
+        params_copy.filtering_rate = 0.0;
+      } else {
+        params_copy.filtering_rate = bitset_filtering_rate(
+          res, {static_cast<int64_t>(idx.dataset().n_rows())}, {sample_filter.bitset_view_});
+      }
     }
     auto sample_filter_copy = sample_filter;
     return search_with_filtering<T, IdxT, decltype(sample_filter_copy), OutputIdxT, DatasetViewT>(
@@ -486,6 +519,7 @@ void search(raft::resources const& res,
     auto& sample_filter =
       dynamic_cast<const cuvs::neighbors::filtering::bloom_filter&>(sample_filter_ref);
     search_params params_copy = params;
+    resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0f) {
       auto const* bloom_filter_obj =
         static_cast<const cuvs::core::bloom_filter*>(sample_filter.filter_data);
@@ -509,6 +543,7 @@ void search(raft::resources const& res,
                  "Roaring filter dataset_rows must equal the number of rows in the index.");
 
     search_params params_copy = params;
+    resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0f) {
       params_copy.filtering_rate = sample_filter.filtering_rate();
     }
@@ -522,6 +557,7 @@ void search(raft::resources const& res,
     auto& sample_filter =
       dynamic_cast<const cuvs::neighbors::filtering::udf_filter&>(sample_filter_ref);
     search_params params_copy = params;
+    resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0) {
       const float min_filtering_rate = 0.0f;
       const float max_filtering_rate = 0.999f;
