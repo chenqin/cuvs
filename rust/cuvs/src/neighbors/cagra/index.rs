@@ -420,6 +420,8 @@ fn serialize_to_hnswlib_impl(handle: &IndexHandle, res: &Resources, filename: &P
 mod tests {
     use super::*;
     use crate::dataset::PaddedDataset;
+    use crate::dlpack::DType;
+    use crate::neighbors::cagra::{FilterExpansion, SearchAlgo};
     use crate::neighbors::filters::{Bitset, Filter};
     use crate::test_utils::DeviceTensor;
     use ndarray::s;
@@ -620,6 +622,147 @@ mod tests {
 
         // First query (row 0) should find itself as the nearest neighbor.
         assert_eq!(neighbors_host[[0, 0]], 0);
+    }
+
+    /// A bitset over the dataset rows with every 32-bit word set to `word`.
+    fn bitset_words(word: u32) -> ndarray::Array1<u32> {
+        ndarray::Array1::from_elem(N_DATAPOINTS.div_ceil(32), word)
+    }
+
+    /// Device address of the first element of `tensor`.
+    fn device_address<T: DType>(tensor: &DeviceTensor<'_, T>) -> usize {
+        tensor.as_dl_tensor().unwrap().to_c().inner.dl_tensor.data as usize
+    }
+
+    /// Test bitset-filtered search with `FilterExpansion::PassingTwoHop`: exclude odd-indexed
+    /// rows, verify they don't appear.
+    #[test]
+    fn test_cagra_search_filtered_passing_two_hop() {
+        let res = Resources::new().unwrap();
+        let build_params = IndexParams::builder().build().unwrap();
+        let dataset = ndarray::Array::<f32, _>::random(
+            (N_DATAPOINTS, N_FEATURES),
+            Uniform::new(0., 1.0).unwrap(),
+        );
+        let dataset_device = DeviceTensor::from_host(&res, &dataset).unwrap();
+        let index = Index::build(&res, &build_params, &dataset_device)
+            .expect("failed to build cagra index");
+
+        // A bitset that includes only even-indexed rows
+        let bitset = DeviceTensor::from_host(&res, &bitset_words(0x5555_5555)).unwrap();
+
+        // Query with the first 4 even-indexed rows
+        let n_queries = 4;
+        let queries = dataset.slice(s![0..n_queries * 2;2, ..]).to_owned(); // rows 0, 2, 4, 6
+        let queries = DeviceTensor::from_host(&res, &queries).unwrap();
+
+        let k = 10;
+        let mut neighbors_host = ndarray::Array::<u32, _>::zeros((n_queries, k));
+        let mut neighbors = DeviceTensor::<u32>::zeros(&res, &[n_queries, k]).unwrap();
+        let mut distances = DeviceTensor::<f32>::zeros(&res, &[n_queries, k]).unwrap();
+
+        let search_params = SearchParams::builder()
+            .algo(SearchAlgo::MultiCta)
+            .filter_expansion(FilterExpansion::PassingTwoHop)
+            .build()
+            .unwrap();
+        let filter = Filter::<Bitset>::new(&bitset).unwrap();
+
+        index
+            .search_filtered(
+                &res,
+                &search_params,
+                &queries,
+                &mut neighbors,
+                &mut distances,
+                &filter,
+            )
+            .unwrap();
+
+        neighbors.copy_to_host(&res, &mut neighbors_host).unwrap();
+
+        for q in 0..n_queries {
+            // Each query is a row that passes the filter, so it is its own nearest neighbor.
+            assert_eq!(neighbors_host[[q, 0]], (q * 2) as u32);
+            // Only even-indexed rows may come back; a slot the search could not fill is u32::MAX.
+            for n in 0..k {
+                let neighbor_id = neighbors_host[[q, n]];
+                assert!(
+                    neighbor_id == u32::MAX || neighbor_id % 2 == 0,
+                    "query {q}, neighbor {n}: got odd index {neighbor_id}, expected only even"
+                );
+            }
+        }
+    }
+
+    /// Test one bitset per query: even queries keep the even-indexed rows and odd queries the
+    /// odd-indexed ones, while the filter's own bitset keeps every row and is not read.
+    #[test]
+    fn test_cagra_search_filtered_query_bitsets() {
+        let res = Resources::new().unwrap();
+        let build_params = IndexParams::builder().build().unwrap();
+        let dataset = ndarray::Array::<f32, _>::random(
+            (N_DATAPOINTS, N_FEATURES),
+            Uniform::new(0., 1.0).unwrap(),
+        );
+        let dataset_device = DeviceTensor::from_host(&res, &dataset).unwrap();
+        let index = Index::build(&res, &build_params, &dataset_device)
+            .expect("failed to build cagra index");
+
+        let even = DeviceTensor::from_host(&res, &bitset_words(0x5555_5555)).unwrap();
+        let odd = DeviceTensor::from_host(&res, &bitset_words(0xAAAA_AAAA)).unwrap();
+        let all = DeviceTensor::from_host(&res, &bitset_words(u32::MAX)).unwrap();
+
+        // Query with the first 4 rows; query `q` gets the bitset that includes row `q`.
+        let n_queries = 4;
+        let queries = dataset.slice(s![0..n_queries, ..]).to_owned();
+        let queries = DeviceTensor::from_host(&res, &queries).unwrap();
+        let pointers = ndarray::Array1::from_shape_fn(n_queries, |q| {
+            device_address(if q % 2 == 0 { &even } else { &odd }) as u64
+        });
+        let pointers = DeviceTensor::from_host(&res, &pointers).unwrap();
+
+        let k = 10;
+        let mut neighbors_host = ndarray::Array::<u32, _>::zeros((n_queries, k));
+        let mut neighbors = DeviceTensor::<u32>::zeros(&res, &[n_queries, k]).unwrap();
+        let mut distances = DeviceTensor::<f32>::zeros(&res, &[n_queries, k]).unwrap();
+
+        let mut search_params = SearchParams::builder()
+            .algo(SearchAlgo::MultiCta)
+            .filter_expansion(FilterExpansion::PassingTwoHop)
+            .build()
+            .unwrap();
+        // SAFETY: `pointers` holds one device address per query, each of a bitset over every row
+        // of the index, and the stream is synchronized before any of them is dropped.
+        unsafe { search_params.set_query_bitsets(device_address(&pointers) as *const *const u32) };
+        let filter = Filter::<Bitset>::new(&all).unwrap();
+
+        index
+            .search_filtered(
+                &res,
+                &search_params,
+                &queries,
+                &mut neighbors,
+                &mut distances,
+                &filter,
+            )
+            .unwrap();
+        res.sync_stream().unwrap();
+
+        neighbors.copy_to_host(&res, &mut neighbors_host).unwrap();
+
+        for q in 0..n_queries {
+            // Each query is a row that passes its own bitset, so it is its own nearest neighbor.
+            assert_eq!(neighbors_host[[q, 0]], q as u32);
+            // Only rows of the query's own bitset may come back; an unfilled slot is u32::MAX.
+            for n in 0..k {
+                let neighbor_id = neighbors_host[[q, n]];
+                assert!(
+                    neighbor_id == u32::MAX || neighbor_id as usize % 2 == q % 2,
+                    "query {q}, neighbor {n}: index {neighbor_id} is not in the query's bitset"
+                );
+            }
+        }
     }
 
     /// Test that an index can be searched multiple times without rebuilding.
