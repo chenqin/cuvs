@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace cuvs::neighbors::cagra {
@@ -141,8 +142,10 @@ class CagraUdfFilterTest : public ::testing::TestWithParam<cagra::search_algo> {
     raft::resource::sync_stream(res);
   }
 
-  cagra_search_result search(cuvs::neighbors::filtering::base_filter const& filter,
-                             float filtering_rate = -1.0f)
+  cagra_search_result search(
+    cuvs::neighbors::filtering::base_filter const& filter,
+    float filtering_rate                          = -1.0f,
+    cagra::filter_expansion_mode filter_expansion = cagra::filter_expansion_mode::SCORE_ALL)
   {
     auto neighbors = raft::make_device_matrix<uint32_t, int64_t>(res, n_queries, k);
     auto distances = raft::make_device_matrix<float, int64_t>(res, n_queries, k);
@@ -153,6 +156,7 @@ class CagraUdfFilterTest : public ::testing::TestWithParam<cagra::search_algo> {
     search_params.max_queries       = 2;
     search_params.thread_block_size = 256;
     search_params.filtering_rate    = filtering_rate;
+    search_params.filter_expansion  = filter_expansion;
 
     cagra::search(res,
                   search_params,
@@ -175,6 +179,61 @@ class CagraUdfFilterTest : public ::testing::TestWithParam<cagra::search_algo> {
   std::optional<raft::device_matrix<float, int64_t>> dataset       = std::nullopt;
   std::optional<raft::device_matrix<float, int64_t>> queries       = std::nullopt;
   std::optional<cagra::device_padded_index<float, uint32_t>> index = std::nullopt;
+};
+
+// MULTI_CTA searches with filter_expansion = PASSING_TWO_HOP. This mode calls the linked predicate
+// for every node it examines and selects its seed nodes by testing random nodes with the predicate.
+class CagraUdfFilterTwoHopTest : public CagraUdfFilterTest {
+ protected:
+  // Minimum recall against each query's exact nearest passing rows (see recall()). The same floor
+  // as the PASSING_TWO_HOP tests in test_filter_two_hop.cu.
+  static constexpr double min_recall = 0.9;
+
+  cagra_search_result two_hop_search(cuvs::neighbors::filtering::base_filter const& filter)
+  {
+    return search(filter, -1.0f, cagra::filter_expansion_mode::PASSING_TWO_HOP);
+  }
+
+  // Expects every returned row to satisfy `passes(query, row)`. Returns the recall against each
+  // query's exact nearest passing rows.
+  template <typename Passes>
+  double recall(cagra_search_result const& result, Passes passes)
+  {
+    std::vector<float> host_dataset(n_rows * n_dim);
+    std::vector<float> host_queries(n_queries * n_dim);
+    auto stream = raft::resource::get_cuda_stream(res);
+    raft::copy(host_dataset.data(), dataset->data_handle(), host_dataset.size(), stream);
+    raft::copy(host_queries.data(), queries->data_handle(), host_queries.size(), stream);
+    raft::resource::sync_stream(res);
+
+    size_t n_found    = 0;
+    size_t n_expected = 0;
+    for (int64_t q = 0; q < n_queries; ++q) {
+      std::vector<std::pair<float, uint32_t>> ranked;
+      for (int64_t row = 0; row < n_rows; ++row) {
+        if (!passes(q, row)) { continue; }
+        float distance = 0;
+        for (int64_t d = 0; d < n_dim; ++d) {
+          float const diff = host_dataset[row * n_dim + d] - host_queries[q * n_dim + d];
+          distance += diff * diff;
+        }
+        ranked.emplace_back(distance, static_cast<uint32_t>(row));
+      }
+      auto const n_nearest = std::min<size_t>(k, ranked.size());
+      std::partial_sort(ranked.begin(), ranked.begin() + n_nearest, ranked.end());
+      n_expected += n_nearest;
+      for (int64_t i = 0; i < k; ++i) {
+        auto const source_id = result.neighbors[static_cast<size_t>(q * k + i)];
+        if (source_id >= static_cast<uint32_t>(n_rows)) { continue; }
+        EXPECT_TRUE(passes(q, static_cast<int64_t>(source_id)))
+          << "query " << q << " returned row " << source_id;
+        n_found += std::any_of(ranked.begin(),
+                               ranked.begin() + n_nearest,
+                               [source_id](auto const& s) { return s.second == source_id; });
+      }
+    }
+    return static_cast<double>(n_found) / static_cast<double>(n_expected);
+  }
 };
 
 class CagraUdfFilterHalfTest : public ::testing::TestWithParam<cagra::search_algo> {
@@ -453,11 +512,70 @@ TEST_P(CagraUdfFilterTest, TenantContextHonorsQuerySpecificMetadata)
   }
 }
 
+TEST_P(CagraUdfFilterTwoHopTest, HighFilteringRateFindsNearestValidNeighbors)
+{
+  cuvs::neighbors::filtering::udf_filter udf_filter(
+    high_filtering_rate_udf_source(), nullptr, high_filtering_rate);
+  auto result = two_hop_search(udf_filter);
+  EXPECT_GE(recall(result, [](int64_t, int64_t row) { return row >= high_filtering_threshold; }),
+            min_recall);
+}
+
+// A predicate that passes no row leaves the search without seed nodes.
+TEST_P(CagraUdfFilterTwoHopTest, RejectAllReturnsNoValidNeighbors)
+{
+  cuvs::neighbors::filtering::udf_filter reject_all(reject_all_udf_source(), nullptr, 0.999f);
+  for (auto source_id : two_hop_search(reject_all).neighbors) {
+    EXPECT_GE(source_id, static_cast<uint32_t>(n_rows));
+  }
+}
+
+// The predicate looks up the tenant of the query by query id. The fixture searches with
+// max_queries = 2, so this also verifies that the batch offset is added to the query id.
+TEST_P(CagraUdfFilterTwoHopTest, TenantContextHonorsQuerySpecificMetadata)
+{
+  std::vector<uint32_t> host_row_tenants(n_rows);
+  std::vector<uint32_t> host_query_tenants(n_queries);
+  for (int64_t i = 0; i < n_rows; ++i) {
+    host_row_tenants[static_cast<size_t>(i)] = static_cast<uint32_t>(i % 3);
+  }
+  for (int64_t q = 0; q < n_queries; ++q) {
+    host_query_tenants[static_cast<size_t>(q)] = static_cast<uint32_t>(q % 3);
+  }
+
+  auto row_tenants   = raft::make_device_vector<uint32_t, int64_t>(res, n_rows);
+  auto query_tenants = raft::make_device_vector<uint32_t, int64_t>(res, n_queries);
+  auto context       = raft::make_device_vector<tenant_filter_context, int64_t>(res, 1);
+
+  auto stream = raft::resource::get_cuda_stream(res);
+  raft::copy(row_tenants.data_handle(), host_row_tenants.data(), host_row_tenants.size(), stream);
+  raft::copy(
+    query_tenants.data_handle(), host_query_tenants.data(), host_query_tenants.size(), stream);
+
+  tenant_filter_context host_context{row_tenants.data_handle(), query_tenants.data_handle()};
+  raft::copy(context.data_handle(), &host_context, 1, stream);
+  raft::resource::sync_stream(res);
+
+  cuvs::neighbors::filtering::udf_filter udf_filter(
+    tenant_udf_source(), context.data_handle(), 2.0f / 3.0f);
+  auto result = two_hop_search(udf_filter);
+  EXPECT_GE(recall(result,
+                   [&](int64_t q, int64_t row) {
+                     return host_row_tenants[static_cast<size_t>(row)] ==
+                            host_query_tenants[static_cast<size_t>(q)];
+                   }),
+            min_recall);
+}
+
 INSTANTIATE_TEST_CASE_P(CagraUdfFilters,
                         CagraUdfFilterTest,
                         ::testing::Values(cagra::search_algo::SINGLE_CTA,
                                           cagra::search_algo::MULTI_CTA,
                                           cagra::search_algo::MULTI_KERNEL));
+
+INSTANTIATE_TEST_CASE_P(CagraUdfFilterTwoHop,
+                        CagraUdfFilterTwoHopTest,
+                        ::testing::Values(cagra::search_algo::MULTI_CTA));
 
 INSTANTIATE_TEST_CASE_P(CagraUdfFilterHalf,
                         CagraUdfFilterHalfTest,

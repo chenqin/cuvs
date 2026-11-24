@@ -368,6 +368,11 @@ void search_multi_partition(
   static_assert(std::is_same_v<IdxT, uint32_t>, "Only uint32_t graph index type is supported");
   static_assert(std::is_same_v<DistanceT, float>, "Only float distances are supported");
 
+  // Multi-partition search does not support PASSING_TWO_HOP: the multi-partition kernels always
+  // use the SCORE_ALL traversal. Reset filter_expansion so that the search plan increases
+  // itopk_size by the filtering rate, as SCORE_ALL requires.
+  params.filter_expansion = filter_expansion_mode::SCORE_ALL;
+
   // The index type in this signature pins the dataset view to the default, so every partition is
   // statically known to hold a padded (non-compressed) device dataset.
   using partition_dataset_view_t = std::remove_cvref_t<decltype(indices[0]->dataset())>;
