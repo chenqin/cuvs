@@ -1238,6 +1238,12 @@ pub enum cuvsCagraHashMode {
     SMALL = 1,
     AUTO_HASH = 100,
 }
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum cuvsCagraFilterExpansion {
+    CUVS_CAGRA_FILTER_SCORE_ALL = 0,
+    CUVS_CAGRA_FILTER_PASSING_TWO_HOP = 1,
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cuvsCagraSearchParams {
@@ -1257,10 +1263,13 @@ pub struct cuvsCagraSearchParams {
     pub persistent: bool,
     pub persistent_lifetime: f32,
     pub persistent_device_usage: f32,
+    pub filtering_rate: f32,
+    pub filter_expansion: cuvsCagraFilterExpansion,
+    pub query_bitsets: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of cuvsCagraSearchParams"][::std::mem::size_of::<cuvsCagraSearchParams>() - 112usize];
+    ["Size of cuvsCagraSearchParams"][::std::mem::size_of::<cuvsCagraSearchParams>() - 128usize];
     ["Alignment of cuvsCagraSearchParams"]
         [::std::mem::align_of::<cuvsCagraSearchParams>() - 8usize];
     ["Offset of field: cuvsCagraSearchParams::max_queries"]
@@ -1295,6 +1304,12 @@ const _: () = {
         [::std::mem::offset_of!(cuvsCagraSearchParams, persistent_lifetime) - 100usize];
     ["Offset of field: cuvsCagraSearchParams::persistent_device_usage"]
         [::std::mem::offset_of!(cuvsCagraSearchParams, persistent_device_usage) - 104usize];
+    ["Offset of field: cuvsCagraSearchParams::filtering_rate"]
+        [::std::mem::offset_of!(cuvsCagraSearchParams, filtering_rate) - 108usize];
+    ["Offset of field: cuvsCagraSearchParams::filter_expansion"]
+        [::std::mem::offset_of!(cuvsCagraSearchParams, filter_expansion) - 112usize];
+    ["Offset of field: cuvsCagraSearchParams::query_bitsets"]
+        [::std::mem::offset_of!(cuvsCagraSearchParams, query_bitsets) - 120usize];
 };
 pub type cuvsCagraSearchParams_t = *mut cuvsCagraSearchParams;
 unsafe extern "C" {
