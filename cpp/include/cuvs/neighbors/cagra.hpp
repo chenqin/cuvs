@@ -176,6 +176,30 @@ struct search_params : cuvs::neighbors::search_params {
    */
   filter_expansion_mode filter_expansion = filter_expansion_mode::SCORE_ALL;
 
+  /**
+   * Per-query filter bitsets for MULTI_CTA search. Not used when null (default).
+   *
+   * When not null, this is a device array with one pointer per query of the search call. Each
+   * pointer is the device address of the 32-bit words of the bitset for that query, with one bit
+   * per row of the index: row `i` passes the filter when bit `i % 32` of word `i / 32` is set. A
+   * null pointer leaves that query unfiltered. The bitset of the filter object passed to the
+   * search is not read, so queries with different filters can share one search call.
+   *
+   * Requirements:
+   *   - The filter passed to the search must be a `filtering::bitset_filter` with standard 32-bit
+   *     packing.
+   *   - `algo` must be MULTI_CTA or AUTO. AUTO selects MULTI_CTA unless `persistent` is set. The
+   *     search fails with any other algorithm.
+   *   - With `SCORE_ALL`, `filtering_rate` must be given (not negative), because it is not
+   *     calculated from per-query bitsets. `PASSING_TWO_HOP` does not use it.
+   *   - Multi-partition search, tiered index search and dynamic batching do not support per-query
+   *     bitsets and fail when this pointer is not null.
+   *
+   * The array and the bitsets must reside on the device that the search runs on and must remain
+   * valid until the work that the search submits to the CUDA stream has completed.
+   */
+  const uint32_t* const* query_bitsets = nullptr;
+
   /** Data type of the query vector and codebook table on shared memory. Currently, only VPQ
    * supports FP8. **/
   internal_dtype smem_dtype = internal_dtype::F16;

@@ -872,6 +872,23 @@ inline auto validate_sample_filter(cuvs::neighbors::filtering::base_filter const
   return sample_filter;
 }
 
+/**
+ * Reject upstream search parameters that hold one entry per query (`query_bitsets`). Dynamic
+ * batching combines requests into a different query-row layout, so the entries would no longer
+ * match the rows of the batched queries. validate_sample_filter() rejects roaring_bitmap_filter
+ * for the same reason.
+ */
+template <typename SearchParamsT>
+inline auto validate_upstream_params(const SearchParamsT& upstream_params) -> const SearchParamsT&
+{
+  if constexpr (requires { upstream_params.query_bitsets; }) {
+    RAFT_EXPECTS(upstream_params.query_bitsets == nullptr,
+                 "dynamic_batching does not support search_params::query_bitsets; use direct "
+                 "cagra::search instead.");
+  }
+  return upstream_params;
+}
+
 template <typename T, typename IdxT>
 class batch_runner {
  public:
@@ -891,8 +908,8 @@ class batch_runner {
     : res_{res},
       upstream_search_{[&upstream_index,
                         upstream_search,
-                        upstream_params,
-                        sample_filter = validate_sample_filter(sample_filter)](
+                        upstream_params = validate_upstream_params(upstream_params),
+                        sample_filter   = validate_sample_filter(sample_filter)](
                          raft::resources const& res,
                          raft::device_matrix_view<const T, int64_t, raft::row_major> queries,
                          raft::device_matrix_view<IdxT, int64_t, raft::row_major> neighbors,
