@@ -328,8 +328,9 @@ TEST_F(CagraFilterTwoHopTest, NoPassingRowReturnsNoNeighbors)
   EXPECT_EQ(std::count(found.begin(), found.end(), invalid_row), n_queries * k);
 }
 
-// A filter type other than a bitset. PASSING_TWO_HOP calls the linked filter for every node it
-// examines and selects its seed nodes by testing random nodes with it.
+// For a filter that is not a bitset with standard 32-bit packing, PASSING_TWO_HOP calls the
+// linked filter for every node it examines and selects its seed nodes by testing random nodes with
+// it.
 TEST_F(CagraFilterTwoHopTest, BloomFilterFindsFilteredNeighbors)
 {
   auto stream = raft::resource::get_cuda_stream(res);
@@ -376,6 +377,16 @@ TEST_F(CagraFilterTwoHopTest, RoaringBitmapFilterFollowsBatchOffset)
 TEST_F(CagraFilterTwoHopOddWidthTest, RoaringBitmapFilterFollowsBatchOffset)
 {
   one_allowlist_per_query_in_batches();
+}
+
+// The words of filter 0 declared as a bitset of 8-bit words pass the same rows. The kernel does
+// not read the words of such a bitset directly: it calls the linked filter.
+TEST_F(CagraFilterTwoHopTest, BitsetOfBytesFindsFilteredNeighbors)
+{
+  cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t> bytes_filter(
+    cuvs::core::bitset_view<uint32_t, int64_t>(bits[0].data_handle(), n_rows, 8));
+  const auto found = search(two_hop_params(), bytes_filter);
+  EXPECT_GE(filtered_recall(found, [](int64_t) { return 0; }), min_recall_two_hop);
 }
 
 // With algo = AUTO, PASSING_TWO_HOP selects MULTI_CTA. max_queries is set so that AUTO would
