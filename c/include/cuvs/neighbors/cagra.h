@@ -446,6 +446,50 @@ enum cuvsCagraSearchAlgo {
 enum cuvsCagraHashMode { HASH = 0, SMALL = 1, AUTO_HASH = 100 };
 
 /**
+ * @brief Defined when cuvsCagraSearchParams has `filtering_rate`, `filter_expansion` and
+ * `query_bitsets`.
+ */
+#define CUVS_CAGRA_HAS_FILTER_EXPANSION 1
+
+/**
+ * @brief Enum to denote how a filtered CAGRA search traverses the graph
+ *
+ * - `CUVS_CAGRA_FILTER_SCORE_ALL`: The distance is computed for every neighbor of a parent node,
+ * whether or not it passes the filter, and a filtered-out node can be selected as a parent node.
+ * Filtered-out nodes are removed from the search results. The MULTI_CTA algorithm increases
+ * `itopk_size` according to `filtering_rate` to compensate for the filtered-out nodes in the itopk
+ * list.
+ * - `CUVS_CAGRA_FILTER_PASSING_TWO_HOP`: The distance is computed only for nodes that pass the
+ * filter, and only these nodes enter the itopk list and are selected as parent nodes. The child
+ * nodes of a parent node are its neighbors that pass the filter and, for each neighbor that is
+ * filtered out (a bridge), the neighbors of the bridge that pass the filter, up to the child
+ * capacity of the result buffer (about `graph_degree` nodes). The initial random seed nodes are
+ * random nodes that pass the filter, each the nearest of up to `num_random_samplings` such nodes.
+ * `itopk_size` is not increased according to `filtering_rate`, and the filtering rate of a BITSET
+ * filter is not computed.
+ *
+ * CUVS_CAGRA_FILTER_PASSING_TWO_HOP is intended for filters that pass a small fraction of the
+ * dataset, where CUVS_CAGRA_FILTER_SCORE_ALL computes most distances for nodes that are filtered
+ * out. The search only moves between nodes that pass the filter and are at most two hops apart in
+ * the graph, so CUVS_CAGRA_FILTER_PASSING_TWO_HOP is effective when the rows that pass the filter
+ * are close to each other in the graph. When fewer than roughly one row in
+ * `graph_degree * graph_degree` passes the filter, the search cannot move beyond its initial random
+ * seed nodes. When the rows that pass are spread uniformly over the dataset at a rate not far above
+ * that, the search converges slowly and needs a much larger `itopk_size` than
+ * CUVS_CAGRA_FILTER_SCORE_ALL for the same recall. Use CUVS_CAGRA_FILTER_SCORE_ALL or an exact
+ * search (cuvsBruteForceSearch with a BITSET filter) for such filters.
+ *
+ * Only the MULTI_CTA search algorithm implements CUVS_CAGRA_FILTER_PASSING_TWO_HOP.
+ * cuvsCagraSearchMultiPartition always uses CUVS_CAGRA_FILTER_SCORE_ALL.
+ */
+enum cuvsCagraFilterExpansion {
+  /** Compute the distance to every neighbor of a parent node; remove filtered-out nodes. */
+  CUVS_CAGRA_FILTER_SCORE_ALL = 0,
+  /** Compute the distance only to nodes that pass the filter, reached through up to two hops. */
+  CUVS_CAGRA_FILTER_PASSING_TWO_HOP = 1
+};
+
+/**
  * @brief Supplemental parameters to search CAGRA index
  *
  */
@@ -515,6 +559,56 @@ struct cuvsCagraSearchParams {
    * impact on the throughput.
    */
   float persistent_device_usage;
+
+  /**
+   * A parameter indicating the rate of nodes to be filtered-out, when filtering is used.
+   *
+   * The value must be greater than 0.0 and less than 1.0. When set to 0 (default), the filtering
+   * rate is automatically calculated when possible. For a BITSET filter, each cuvsCagraSearch
+   * call then counts the bits of the bitset and waits for the result, unless `filter_expansion`
+   * is CUVS_CAGRA_FILTER_PASSING_TWO_HOP, which does not use the rate.
+   * cuvsCagraSearchMultiPartition then counts the bits of the partition bitsets in every call.
+   */
+  float filtering_rate;
+
+  /**
+   * How a filtered search traverses the graph (see `cuvsCagraFilterExpansion`).
+   * Default: CUVS_CAGRA_FILTER_SCORE_ALL.
+   *
+   * CUVS_CAGRA_FILTER_PASSING_TWO_HOP is implemented by the MULTI_CTA algorithm only. It selects
+   * MULTI_CTA when `algo` is AUTO, unless `persistent` is set. The other algorithms ignore it and
+   * log a warning. cuvsCagraSearchParamsCreate leaves `algo` at SINGLE_CTA (0), so `algo` must be
+   * set to MULTI_CTA (or AUTO) for CUVS_CAGRA_FILTER_PASSING_TWO_HOP to take effect.
+   * cuvsCagraSearchMultiPartition always uses CUVS_CAGRA_FILTER_SCORE_ALL. The value has no effect
+   * on a search without a filter.
+   */
+  enum cuvsCagraFilterExpansion filter_expansion;
+
+  /**
+   * Per-query filter bitsets for MULTI_CTA search. Not used when 0 (default).
+   *
+   * When not 0, this is the device address of an array with one pointer per query of the search
+   * call. Each pointer is the device address of the 32-bit words of the bitset for that query,
+   * with one bit per row of the index: row `i` passes the filter when bit `i % 32` of word
+   * `i / 32` is set. A null pointer leaves that query unfiltered. The bitset of the cuvsFilter
+   * passed to the search is not read, so queries with different filters can share one search
+   * call.
+   *
+   * Requirements:
+   *   - The cuvsFilter passed to the search must be a BITSET filter (standard 32-bit packing).
+   *   - `algo` must be MULTI_CTA or AUTO (cuvsCagraSearchParamsCreate leaves it at SINGLE_CTA).
+   *     AUTO selects MULTI_CTA unless `persistent` is set. The search fails with any other
+   *     algorithm.
+   *   - With CUVS_CAGRA_FILTER_SCORE_ALL, `filtering_rate` must be greater than 0, because it is
+   *     not calculated from per-query bitsets. CUVS_CAGRA_FILTER_PASSING_TWO_HOP does not use it.
+   *   - cuvsCagraSearchMultiPartition and cuvsTieredIndexSearch do not support per-query bitsets
+   *     and fail when this value is not 0.
+   *
+   * The array and the bitsets must reside on the device that the search runs on and must remain
+   * valid until the work that the search submits to the CUDA stream has completed (see
+   * cuvsStreamSync).
+   */
+  uintptr_t query_bitsets;
 };
 
 typedef struct cuvsCagraSearchParams* cuvsCagraSearchParams_t;
