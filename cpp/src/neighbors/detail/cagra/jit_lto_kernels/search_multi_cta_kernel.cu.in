@@ -69,10 +69,13 @@ extern "C" __global__ __launch_bounds__(1024, 1) void search_multi_cta(
 }
 
 // Variant of search_multi_cta for thread blocks of at most kSmallBlockMaxThreads threads. Its
-// launch bounds request that at least 6 thread blocks of that size fit on a multiprocessor; those
-// of search_multi_cta request one thread block of 1024 threads. select_and_run() launches this
-// variant when the thread block size is at most kSmallBlockMaxThreads.
-extern "C" __global__ __launch_bounds__(kSmallBlockMaxThreads, 6) void search_multi_cta_small(
+// launch bounds request that at least kSmallBlockMinBlocksPerSm thread blocks of that size fit on
+// a multiprocessor; those of search_multi_cta request one thread block of 1024 threads.
+// select_and_run() launches this variant when the thread block size is at most
+// kSmallBlockMaxThreads and the multiprocessors hold that many thread blocks (see
+// use_small_block_entry_point).
+extern "C" __global__
+__launch_bounds__(kSmallBlockMaxThreads, kSmallBlockMinBlocksPerSm) void search_multi_cta_small(
   index_t* const result_indices_ptr,
   distance_t* const result_distances_ptr,
   const dataset_desc_base* dataset_desc,
