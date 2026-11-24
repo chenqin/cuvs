@@ -119,7 +119,9 @@ void select_and_run(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dat
                                       DistanceT,
                                       SourceIndexT,
                                       sample_filter_jit_tag_t<SampleFilterT>>(
-      dataset_desc, make_cagra_sample_filter_udf_fragment<SourceIndexT>(sample_filter));
+      dataset_desc,
+      make_cagra_sample_filter_udf_fragment<SourceIndexT>(sample_filter),
+      /*small=*/block_size <= kSmallBlockMaxThreads);
 
   if (!launcher) { RAFT_FAIL("Failed to get JIT launcher"); }
 

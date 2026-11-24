@@ -108,6 +108,10 @@ using search_single_cta_p_kernel_func_t =
 
 namespace multi_cta_search {
 
+/// Maximum thread block size of the `search_multi_cta_small` entry point: the thread limit in its
+/// `__launch_bounds__`, and the largest thread block size for which the launcher selects it.
+inline constexpr std::uint32_t kSmallBlockMaxThreads = 256;
+
 template <typename DataT, typename IndexT, typename DistanceT, typename SourceIndexT>
 using search_multi_cta_mp_kernel_func_t =
   void(const multi_partition_desc_t<DataT, IndexT, DistanceT>*,
