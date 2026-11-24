@@ -141,7 +141,11 @@ namespace {
 // Runs a filtered multi-partition MULTI_CTA search where every partition keeps only ~4% of its rows
 // (still more than k each) and reports the number of queries that returned fewer than k neighbors
 // and the recall against an exact search over the kept rows.
-void search_with_selective_filter(float filtering_rate, int& short_queries, double& recall)
+void search_with_selective_filter(
+  float filtering_rate,
+  int& short_queries,
+  double& recall,
+  cagra::filter_expansion_mode filter_expansion = cagra::filter_expansion_mode::SCORE_ALL)
 {
   raft::resources handle;
   auto stream = raft::resource::get_cuda_stream(handle);
@@ -205,6 +209,8 @@ void search_with_selective_filter(float filtering_rate, int& short_queries, doub
   search_params.algo           = search_algo::MULTI_CTA;
   search_params.itopk_size     = k;
   search_params.filtering_rate = filtering_rate;
+
+  search_params.filter_expansion = filter_expansion;
 
   cagra::search(
     handle,
@@ -280,6 +286,20 @@ TEST(AnnCagraMultiPartition, SelectiveFilterReturnsKNeighbors)
   double recall     = 0;
   search_with_selective_filter(-1.0f, short_queries, recall);
   EXPECT_EQ(short_queries, 0) << "queries returning fewer than k neighbors";
+  EXPECT_GE(recall, 0.95);
+}
+
+// Multi-partition search always uses SCORE_ALL and ignores filter_expansion. If PASSING_TWO_HOP
+// reached the search plan, itopk_size would not be increased by the filtering rate and this
+// selective filter would leave queries with fewer than k neighbors.
+TEST(AnnCagraMultiPartition, SelectiveFilterReturnsKNeighborsWithPassingTwoHop)
+{
+  int short_queries = 0;
+  double recall     = 0;
+  search_with_selective_filter(
+    -1.0f, short_queries, recall, cagra::filter_expansion_mode::PASSING_TWO_HOP);
+  EXPECT_EQ(short_queries, 0) << "queries returning fewer than k neighbors";
+  // The floor of SelectiveFilterReturnsKNeighbors: both tests run the same SCORE_ALL search.
   EXPECT_GE(recall, 0.95);
 }
 

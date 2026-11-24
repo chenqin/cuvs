@@ -263,6 +263,13 @@ ConfigureTest(
 )
 
 ConfigureTest(
+  NAME NEIGHBORS_ANN_CAGRA_FILTER_TWO_HOP_TEST
+  PATH neighbors/ann_cagra/test_filter_two_hop.cu
+  GPUS 1
+  PERCENT 100
+)
+
+ConfigureTest(
   NAME NEIGHBORS_ANN_CAGRA_HELPERS_TEST
   PATH neighbors/ann_cagra/test_optimize_uint32_t.cu neighbors/ann_cagra/test_batch_load_iterator.cu
        neighbors/ann_cagra/test_serialize_dataset_layouts.cu
