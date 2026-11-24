@@ -25,6 +25,9 @@ public class CagraSearchParams {
   private long randXORMask;
   private SearchAlgo searchAlgo;
   private HashMapMode hashMapMode;
+  private float filteringRate;
+  private FilterExpansion filterExpansion;
+  private long queryBitsets;
 
   /**
    * Enum to denote algorithm used to search CAGRA Index.
@@ -85,6 +88,59 @@ public class CagraSearchParams {
   }
 
   /**
+   * Enum to denote how a filtered CAGRA search traverses the graph.
+   *
+   * <p>{@link #PASSING_TWO_HOP} is intended for filters that pass a small
+   * fraction of the dataset, where {@link #SCORE_ALL} computes most distances
+   * for nodes that are filtered out. The search only moves between nodes that
+   * pass the filter and are at most two hops apart in the graph, so
+   * {@link #PASSING_TWO_HOP} is effective when the rows that pass the filter
+   * are close to each other in the graph. When fewer than roughly one row in
+   * {@code graphDegree * graphDegree} passes the filter, the search cannot move
+   * beyond its initial random seed nodes. When the rows that pass are spread
+   * uniformly over the dataset at a rate not far above that, the search
+   * converges slowly and needs a much larger itopk size than {@link #SCORE_ALL}
+   * for the same recall. Use {@link #SCORE_ALL} or an exact search
+   * ({@link BruteForceIndex} with a prefilter) for such filters.
+   *
+   * <p>Only the MULTI_CTA search algorithm implements {@link #PASSING_TWO_HOP}.
+   * {@link MultiPartitionCagraSearch} always uses {@link #SCORE_ALL}.
+   */
+  public enum FilterExpansion {
+    /**
+     * The distance is computed for every neighbor of a parent node, whether or
+     * not it passes the filter, and a filtered-out node can be selected as a
+     * parent node. Filtered-out nodes are removed from the search results. The
+     * MULTI_CTA algorithm increases the itopk size according to the filtering
+     * rate to compensate for the filtered-out nodes in the itopk list.
+     */
+    SCORE_ALL(0),
+    /**
+     * The distance is computed only for nodes that pass the filter, and only
+     * these nodes enter the itopk list and are selected as parent nodes. The
+     * child nodes of a parent node are its neighbors that pass the filter and,
+     * for each neighbor that is filtered out (a bridge), the neighbors of the
+     * bridge that pass the filter, up to the child capacity of the result
+     * buffer (about the graph degree). The initial random seed nodes are random
+     * nodes that pass the filter, each the nearest of up to as many such nodes
+     * as the number of random samplings (see
+     * {@link Builder#withNumRandomSamplings(int)}). The itopk size is not
+     * increased according to the filtering rate, and the filtering rate of the
+     * prefilter is not computed.
+     */
+    PASSING_TWO_HOP(1);
+
+    /**
+     * The value for the enum choice.
+     */
+    public final int value;
+
+    private FilterExpansion(int value) {
+      this.value = value;
+    }
+  }
+
+  /**
    * Constructs an instance of CagraSearchParams with passed search parameters.
    *
    * @param maxQueries         the maximum number of queries to search at the same
@@ -106,6 +162,11 @@ public class CagraSearchParams {
    *                           node selection
    * @param randXORMask        the bit mask used for initial random seed node
    *                           selection
+   * @param filteringRate      the rate of nodes to be filtered-out, when
+   *                           filtering is used
+   * @param filterExpansion    how a filtered search traverses the graph
+   * @param queryBitsets       the device address of an array with one bitset
+   *                           pointer per query
    */
   private CagraSearchParams(
       int maxQueries,
@@ -120,7 +181,10 @@ public class CagraSearchParams {
       int hashmapMinBitlen,
       float hashmapMaxFillRate,
       int numRandomSamplings,
-      long randXORMask) {
+      long randXORMask,
+      float filteringRate,
+      FilterExpansion filterExpansion,
+      long queryBitsets) {
     this.maxQueries = maxQueries;
     this.iTopKSize = iTopKSize;
     this.maxIterations = maxIterations;
@@ -134,6 +198,9 @@ public class CagraSearchParams {
     this.hashMapMaxFillRate = hashmapMaxFillRate;
     this.numRandomSamplings = numRandomSamplings;
     this.randXORMask = randXORMask;
+    this.filteringRate = filteringRate;
+    this.filterExpansion = filterExpansion;
+    this.queryBitsets = queryBitsets;
   }
 
   /**
@@ -254,6 +321,33 @@ public class CagraSearchParams {
     return hashMapMode;
   }
 
+  /**
+   * Gets the rate of nodes to be filtered-out, when filtering is used.
+   *
+   * @return the filtering rate, or 0 when it is automatically calculated
+   */
+  public float getFilteringRate() {
+    return filteringRate;
+  }
+
+  /**
+   * Gets how a filtered search traverses the graph.
+   *
+   * @return the configured {@link FilterExpansion}
+   */
+  public FilterExpansion getFilterExpansion() {
+    return filterExpansion;
+  }
+
+  /**
+   * Gets the device address of the array with one bitset pointer per query.
+   *
+   * @return the device address, or 0 when there are no per-query bitsets
+   */
+  public long getQueryBitsets() {
+    return queryBitsets;
+  }
+
   @Override
   public String toString() {
     return "CagraSearchParams [maxQueries="
@@ -282,6 +376,12 @@ public class CagraSearchParams {
         + numRandomSamplings
         + ", randXORMask="
         + randXORMask
+        + ", filteringRate="
+        + filteringRate
+        + ", filterExpansion="
+        + filterExpansion
+        + ", queryBitsets="
+        + queryBitsets
         + "]";
   }
 
@@ -303,6 +403,9 @@ public class CagraSearchParams {
     private long randXORMask = 0x128394;
     private SearchAlgo searchAlgo = SearchAlgo.AUTO;
     private HashMapMode hashMapMode = HashMapMode.AUTO_HASH;
+    private float filteringRate;
+    private FilterExpansion filterExpansion = FilterExpansion.SCORE_ALL;
+    private long queryBitsets;
 
     /**
      * Default constructor.
@@ -461,6 +564,79 @@ public class CagraSearchParams {
     }
 
     /**
+     * Sets the rate of nodes to be filtered-out, when filtering is used.
+     *
+     * <p>The value must be greater than 0.0 and less than 1.0. When set to 0
+     * (default), the filtering rate is automatically calculated: each
+     * {@link CagraIndex} search with a prefilter then counts the bits of the
+     * prefilter and waits for the result, unless the filter expansion is
+     * {@link FilterExpansion#PASSING_TWO_HOP}, which does not use the rate.
+     * {@link MultiPartitionCagraSearch} then counts the bits of the partition
+     * filters in every call.
+     *
+     * @param filteringRate the rate of nodes to be filtered-out
+     * @return an instance of this Builder
+     */
+    public Builder withFilteringRate(float filteringRate) {
+      this.filteringRate = filteringRate;
+      return this;
+    }
+
+    /**
+     * Sets how a filtered search traverses the graph (see
+     * {@link FilterExpansion}). Default: {@link FilterExpansion#SCORE_ALL}.
+     *
+     * <p>{@link FilterExpansion#PASSING_TWO_HOP} is implemented by the
+     * MULTI_CTA algorithm only. It selects MULTI_CTA when the search algorithm
+     * is {@link SearchAlgo#AUTO}. The other algorithms ignore it and log a
+     * warning. {@link MultiPartitionCagraSearch} always uses
+     * {@link FilterExpansion#SCORE_ALL}. The value has no effect on a search
+     * without a prefilter.
+     *
+     * @param filterExpansion the {@link FilterExpansion} to use
+     * @return an instance of this Builder
+     */
+    public Builder withFilterExpansion(FilterExpansion filterExpansion) {
+      this.filterExpansion = filterExpansion;
+      return this;
+    }
+
+    /**
+     * Sets per-query filter bitsets for MULTI_CTA search. Not used when 0
+     * (default).
+     *
+     * <p>When not 0, this is the device address of an array with one pointer
+     * per query of the search call. Each pointer is the device address of the
+     * 32-bit words of the bitset for that query, with one bit per row of the
+     * index: row {@code i} passes the filter when bit {@code i % 32} of word
+     * {@code i / 32} is set. A null pointer leaves that query unfiltered. The
+     * bitset of the prefilter given to the query is not read, so queries with
+     * different filters can share one search call.
+     *
+     * <p>The query must be given a prefilter with
+     * {@link CagraQuery.Builder#withPrefilter}. The search algorithm must be
+     * {@link SearchAlgo#MULTI_CTA} or {@link SearchAlgo#AUTO}, which then
+     * selects MULTI_CTA; the search fails with any other algorithm. With
+     * {@link FilterExpansion#SCORE_ALL}, the filtering rate must be greater
+     * than 0, because it is not calculated from per-query bitsets.
+     * {@link FilterExpansion#PASSING_TWO_HOP} does not use it.
+     * {@link MultiPartitionCagraSearch} and {@link TieredIndex} do not support
+     * per-query bitsets and fail when this value is not 0.
+     *
+     * <p>The array and the bitsets are not copied: they must reside on the
+     * device that the search runs on and must remain valid until the work that
+     * the search submits to the CUDA stream has completed.
+     *
+     * @param queryBitsets the device address of an array with one bitset pointer
+     *                     per query, or 0 for none
+     * @return an instance of this Builder
+     */
+    public Builder withQueryBitsets(long queryBitsets) {
+      this.queryBitsets = queryBitsets;
+      return this;
+    }
+
+    /**
      * Builds an instance of {@link CagraSearchParams} with passed search
      * parameters.
      *
@@ -480,7 +656,10 @@ public class CagraSearchParams {
           hashMapMinBitlen,
           hashMapMaxFillRate,
           numRandomSamplings,
-          randXORMask);
+          randXORMask,
+          filteringRate,
+          filterExpansion,
+          queryBitsets);
     }
   }
 }

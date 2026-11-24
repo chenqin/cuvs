@@ -421,6 +421,11 @@ public class TieredIndexImpl implements TieredIndex {
     cuvsCagraSearchParams.hashmap_max_fill_rate(seg, params.getHashMapMaxFillRate());
     cuvsCagraSearchParams.num_random_samplings(seg, params.getNumRandomSamplings());
     cuvsCagraSearchParams.rand_xor_mask(seg, params.getRandXORMask());
+    cuvsCagraSearchParams.filtering_rate(seg, params.getFilteringRate());
+    if (params.getFilterExpansion() != null) {
+      cuvsCagraSearchParams.filter_expansion(seg, params.getFilterExpansion().value);
+    }
+    cuvsCagraSearchParams.query_bitsets(seg, params.getQueryBitsets());
     return seg;
   }
 
