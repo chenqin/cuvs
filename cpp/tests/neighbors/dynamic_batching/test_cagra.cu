@@ -164,4 +164,38 @@ TEST(dynamic_batching_upstream_error, every_request_throws)
   }
 }
 
+/**
+ * Batching changes the query-row mapping, so an upstream search parameter that holds one entry
+ * per query (cagra::search_params::query_bitsets) must be rejected when the index is created.
+ */
+TEST(dynamic_batching_upstream_params, query_bitsets_rejected)
+{
+  raft::resources res;
+  constexpr int64_t n_rows = 1000;
+  constexpr int64_t dim    = 32;
+  constexpr int64_t k      = 10;
+
+  auto dataset = raft::make_device_matrix<float, int64_t>(res, n_rows, dim);
+  raft::random::RngState rng(1234ULL);
+  raft::random::uniform(res, rng, dataset.data_handle(), dataset.size(), -1.0f, 1.0f);
+
+  cagra::index_params ip;
+  ip.graph_degree              = 32;
+  ip.intermediate_graph_degree = 64;
+  auto upstream =
+    build_cagra_with_dataset<float, uint32_t>(res, ip, raft::make_const_mdspan(dataset.view()));
+
+  auto make_index = [&](cagra::search_params const& upstream_params) {
+    dynamic_batching::index<float, uint32_t>{
+      res, dynamic_batching::index_params{{}, k, 64, 3, false}, upstream, upstream_params};
+  };
+  cagra::search_params upstream_params;
+  EXPECT_NO_THROW(make_index(upstream_params));
+
+  // The pointer array is never read: index creation is rejected before any search.
+  const uint32_t* const query_bitsets[] = {nullptr};
+  upstream_params.query_bitsets         = query_bitsets;
+  EXPECT_THROW(make_index(upstream_params), raft::logic_error);
+}
+
 }  // namespace cuvs::neighbors::dynamic_batching

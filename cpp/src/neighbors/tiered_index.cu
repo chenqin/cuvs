@@ -221,6 +221,11 @@ void search(raft::resources const& res,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances,
             const cuvs::neighbors::filtering::base_filter& sample_filter)
 {
+  // query_bitsets is read by cagra::search only. The brute-force search of the rows that are not
+  // in the CAGRA index yet would apply the bitset of `sample_filter` to every query instead.
+  RAFT_EXPECTS(search_params.query_bitsets == nullptr,
+               "tiered_index::search does not support search_params::query_bitsets; use direct "
+               "cagra::search instead.");
   std::shared_lock<std::shared_mutex> lock(index.ann_mutex);
   index.state->search(
     res, search_params, cagra::search, queries, neighbors, distances, sample_filter);
@@ -234,6 +239,11 @@ void search(raft::resources const& res,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances,
             const cuvs::neighbors::filtering::base_filter& sample_filter)
 {
+  // query_bitsets is read by cagra::search only. The brute-force search of the rows that are not
+  // in the CAGRA index yet would apply the bitset of `sample_filter` to every query instead.
+  RAFT_EXPECTS(search_params.query_bitsets == nullptr,
+               "tiered_index::search does not support search_params::query_bitsets; use direct "
+               "cagra::search instead.");
   std::shared_lock<std::shared_mutex> lock(index.ann_mutex);
   if (!index.state->ann_index) {
     index.state->search(

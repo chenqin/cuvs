@@ -445,20 +445,22 @@ inline float bitset_filtering_rate(
 }
 
 /**
- * Resolve `params.algo` for a filtered search that uses PASSING_TWO_HOP, which is implemented by
- * the MULTI_CTA search algorithm only.
+ * Resolve `params.algo` for a filtered search that uses PASSING_TWO_HOP or `query_bitsets`, which
+ * are implemented by the MULTI_CTA search algorithm only.
  *
  * AUTO becomes MULTI_CTA unless `persistent` is set (search_plan_impl_base then selects
- * SINGLE_CTA). If the algorithm is not MULTI_CTA after that, a warning is logged, because the
- * other algorithms ignore PASSING_TWO_HOP.
+ * SINGLE_CTA). If PASSING_TWO_HOP is requested and the algorithm is not MULTI_CTA after that, a
+ * warning is logged, because the other algorithms ignore PASSING_TWO_HOP. `query_bitsets` with an
+ * algorithm other than MULTI_CTA is rejected by search_plan_impl::check_params().
  */
 inline void resolve_filtered_search_algo(search_params& params)
 {
-  if (params.filter_expansion != filter_expansion_mode::PASSING_TWO_HOP) { return; }
+  const bool two_hop = params.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP;
+  if (!two_hop && params.query_bitsets == nullptr) { return; }
   if (params.algo == search_algo::AUTO && !params.persistent) {
     params.algo = search_algo::MULTI_CTA;
-    RAFT_LOG_DEBUG("Auto strategy: PASSING_TWO_HOP set, selecting multi-cta");
-  } else if (params.algo != search_algo::MULTI_CTA) {
+    RAFT_LOG_DEBUG("Auto strategy: PASSING_TWO_HOP or query_bitsets set, selecting multi-cta");
+  } else if (two_hop && params.algo != search_algo::MULTI_CTA) {
     RAFT_LOG_WARN(
       "CAGRA filter_expansion PASSING_TWO_HOP is only supported with MULTI_CTA search (algo=%d); "
       "filter_expansion will have no effect",
@@ -505,6 +507,9 @@ void search(raft::resources const& res,
         // for SCORE_ALL), so the bits of the filter are not counted.
         params_copy.filtering_rate = 0.0;
       } else {
+        RAFT_EXPECTS(params.query_bitsets == nullptr,
+                     "search_params::filtering_rate must be given when "
+                     "search_params::query_bitsets is used with filter_expansion_mode::SCORE_ALL.");
         params_copy.filtering_rate = bitset_filtering_rate(
           res, {static_cast<int64_t>(idx.dataset().n_rows())}, {sample_filter.bitset_view_});
       }
