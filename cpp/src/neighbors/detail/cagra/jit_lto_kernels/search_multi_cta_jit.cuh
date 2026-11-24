@@ -357,15 +357,23 @@ RAFT_DEVICE_INLINE_FUNCTION void search_core(
     (filter_payload.flags & kCagraFilterPassingTwoHop) != 0 && seed_ptr == nullptr;
 
   // Filter setup (see the kCagraFilter* flags in cagra_filter_payload.cuh):
-  //   - kCagraFilterBitsetWords: filter_words is the bitset of the filter object.
-  //   - otherwise:               filter_words is null and `passes` calls the linked sample_filter.
+  //   - kCagraFilterQueryBitsets: filter_words is the bitset of this query. A null pointer means
+  //                               that the query is not filtered.
+  //   - kCagraFilterBitsetWords:  filter_words is the bitset of the filter object.
+  //   - otherwise:                filter_words is null and `passes` calls the linked
+  //                               sample_filter.
+  const bool has_query_bitsets = (filter_payload.flags & kCagraFilterQueryBitsets) != 0;
   const uint32_t* filter_words = nullptr;
-  if (filter_payload.flags & kCagraFilterBitsetWords) {
+  if (has_query_bitsets) {
+    filter_words =
+      static_cast<const uint32_t* const*>(filter_payload.filter_data)[query_id + query_id_offset];
+  } else if (filter_payload.flags & kCagraFilterBitsetWords) {
     filter_words = static_cast<const BitsetT*>(filter_payload.filter_data)->bitset_ptr;
   }
   auto passes = [&](const INDEX_T node) -> bool {
     const auto source = to_source_index(node);
     if (filter_words != nullptr) { return (filter_words[source >> 5] >> (source & 31u)) & 1u; }
+    if (has_query_bitsets) { return true; }
     return sample_filter<SourceIndexT>(
       query_id + query_id_offset, source, filter_payload.sample_filter_data());
   };

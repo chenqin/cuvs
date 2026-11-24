@@ -248,4 +248,31 @@ INSTANTIATE_TEST_CASE_P(ANNTieredIndexTest, IvfFlat_F, ::testing::ValuesIn(input
 typedef ANNTieredIndexTest<ivf_pq::typed_index<float, int64_t>> IvfPq_F;
 TEST_P(IvfPq_F, AnnTieredIndex) { this->testTieredIndex(); }
 INSTANTIATE_TEST_CASE_P(ANNTieredIndexTest, IvfPq_F, ::testing::ValuesIn(inputs));
+
+// query_bitsets would only apply to the CAGRA tier (the brute-force tier filters every query by
+// the bitset of the filter object), so tiered_index::search must reject it.
+TEST(TieredIndexCagra, RejectsQueryBitsets)
+{
+  raft::resources res;
+  constexpr int64_t n_rows = 64, dim = 16, n_queries = 2, k = 4;
+  auto database = raft::make_device_matrix<float, int64_t>(res, n_rows, dim);
+  raft::random::RngState r(42ULL);
+  raft::random::normal(res, r, database.data_handle(), n_rows * dim, 0.1f, 2.0f);
+
+  index_params<cagra::index_params> build_params;
+  auto index = build(res, build_params, raft::make_const_mdspan(database.view()));
+
+  auto queries =
+    raft::make_device_matrix_view<const float, int64_t>(database.data_handle(), n_queries, dim);
+  auto neighbors = raft::make_device_matrix<int64_t, int64_t>(res, n_queries, k);
+  auto distances = raft::make_device_matrix<float, int64_t>(res, n_queries, k);
+  auto pointers  = raft::make_device_vector<uintptr_t, int64_t>(res, n_queries);
+
+  cagra::search_params search_params;
+  EXPECT_NO_THROW(search(res, search_params, index, queries, neighbors.view(), distances.view()));
+  // The pointer array is never read: the search is rejected first.
+  search_params.query_bitsets = reinterpret_cast<const uint32_t* const*>(pointers.data_handle());
+  EXPECT_THROW(search(res, search_params, index, queries, neighbors.view(), distances.view()),
+               raft::logic_error);
+}
 }  // namespace cuvs::neighbors::tiered_index

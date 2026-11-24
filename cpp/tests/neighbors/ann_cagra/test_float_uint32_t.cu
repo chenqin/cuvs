@@ -303,6 +303,19 @@ TEST(AnnCagraMultiPartition, SelectiveFilterReturnsKNeighborsWithPassingTwoHop)
   EXPECT_GE(recall, 0.95);
 }
 
+// query_bitsets is only supported by single-index search: multi-partition search filters each
+// partition by its own bitset, so the call must be rejected. The pointer array is never read
+// because the search is rejected first.
+TEST(AnnCagraMultiPartition, QueryBitsetsRejected)
+{
+  const uint32_t* const query_bitsets[] = {nullptr};
+  cagra::search_params search_params;
+  search_params.query_bitsets = query_bitsets;
+  expect_multi_partition_search_throws({{cuvs::distance::DistanceType::L2Expanded, 16},
+                                        {cuvs::distance::DistanceType::L2Expanded, 16}},
+                                       search_params);
+}
+
 // The shared plan descriptor and the cross-partition select_k direction are derived from
 // indices[0], so all partitions must share one metric; a mismatch must be rejected.
 TEST(AnnCagraMultiPartition, MixedMetricRejected)
