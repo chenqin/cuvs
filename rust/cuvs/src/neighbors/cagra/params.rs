@@ -20,7 +20,7 @@ use bon::bon;
 use crate::distance::DistanceType;
 use crate::error::check_cuvs;
 
-use super::{CagraError, GraphBuildAlgo, HashMode, SearchAlgo};
+use super::{CagraError, FilterExpansion, GraphBuildAlgo, HashMode, SearchAlgo};
 
 #[derive(Debug)]
 enum RequestedGraphBuild {
@@ -247,6 +247,8 @@ impl SearchParams {
         persistent: Option<bool>,
         persistent_lifetime: Option<f32>,
         persistent_device_usage: Option<f32>,
+        filtering_rate: Option<f32>,
+        filter_expansion: Option<FilterExpansion>,
     ) -> Result<Self, CagraError> {
         let params = Self::create_handle()?;
 
@@ -312,6 +314,14 @@ impl SearchParams {
             )));
         }
 
+        if let Some(rate) = filtering_rate
+            && (!rate.is_finite() || rate <= 0.0 || rate >= 1.0)
+        {
+            return Err(CagraError::Validation(format!(
+                "filtering_rate must be in (0, 1), got {rate}"
+            )));
+        }
+
         if effective_algo == SearchAlgo::MultiCta && effective_hashmap_mode == HashMode::Small {
             return Err(CagraError::Validation(
                 "`small_hash` is not available when 'search_mode' is \"multi-cta\"".into(),
@@ -367,6 +377,12 @@ impl SearchParams {
             if let Some(v) = persistent_device_usage {
                 (*params.handle).persistent_device_usage = v;
             }
+            if let Some(v) = filtering_rate {
+                (*params.handle).filtering_rate = v;
+            }
+            if let Some(v) = filter_expansion {
+                (*params.handle).filter_expansion = v.into();
+            }
         }
 
         Ok(params)
@@ -383,6 +399,42 @@ impl SearchParams {
 
     pub(super) fn handle(&self) -> ffi::cuvsCagraSearchParams_t {
         self.handle
+    }
+
+    /// Sets per-query filter bitsets for [`SearchAlgo::MultiCta`] search. Not
+    /// used when null (default).
+    ///
+    /// When not null, `bitsets` is the device address of an array with one
+    /// pointer per query of the search call. Each pointer is the device
+    /// address of the 32-bit words of the bitset for that query, with one bit
+    /// per row of the index: row `i` passes the filter when bit `i % 32` of
+    /// word `i / 32` is set. A null pointer in the array leaves that query
+    /// unfiltered. The bitset of the [`Filter`](super::Filter) passed to the
+    /// search is not read, so queries with different filters can share one
+    /// search call.
+    ///
+    /// The search must be given a [`Filter`](super::Filter), as in
+    /// [`Index::search_filtered`](super::Index::search_filtered). `algo` must
+    /// be [`SearchAlgo::MultiCta`] or [`SearchAlgo::Auto`] (it defaults to
+    /// [`SearchAlgo::SingleCta`]); [`SearchAlgo::Auto`] selects
+    /// [`SearchAlgo::MultiCta`] unless `persistent` is set, and the search
+    /// fails with any other algorithm. With [`FilterExpansion::ScoreAll`],
+    /// `filtering_rate` must be given, because it is not calculated from
+    /// per-query bitsets. [`FilterExpansion::PassingTwoHop`] does not use it.
+    ///
+    /// # Safety
+    ///
+    /// The address is stored as given and read by every search run with these
+    /// parameters until it is replaced or reset to null. For each such search,
+    /// the caller must guarantee that:
+    /// - `bitsets` is the address, on the device that the search runs on, of
+    ///   an array with one pointer per query;
+    /// - each of those pointers is null or the address, on the same device, of
+    ///   the 32-bit words of a bitset that covers every row of the index;
+    /// - the array and the bitsets remain valid until the work that the search
+    ///   submits to the CUDA stream has completed.
+    pub unsafe fn set_query_bitsets(&mut self, bitsets: *const *const u32) {
+        unsafe { (*self.handle).query_bitsets = bitsets as usize };
     }
 }
 
@@ -493,6 +545,12 @@ mod tests {
         unsafe {
             assert_eq!((*params.handle).itopk_size, 64);
             assert_eq!((*params.handle).algo, ffi::cuvsCagraSearchAlgo::SINGLE_CTA);
+            assert_eq!((*params.handle).filtering_rate, 0.0);
+            assert_eq!(
+                (*params.handle).filter_expansion,
+                ffi::cuvsCagraFilterExpansion::CUVS_CAGRA_FILTER_SCORE_ALL
+            );
+            assert_eq!((*params.handle).query_bitsets, 0);
         }
     }
 
@@ -545,5 +603,51 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("small_hash"));
+    }
+
+    #[test]
+    fn search_params_sets_filter_fields() {
+        let params = SearchParams::builder()
+            .filtering_rate(0.9)
+            .filter_expansion(FilterExpansion::PassingTwoHop)
+            .build()
+            .unwrap();
+
+        unsafe {
+            assert_eq!((*params.handle).filtering_rate, 0.9);
+            assert_eq!(
+                (*params.handle).filter_expansion,
+                ffi::cuvsCagraFilterExpansion::CUVS_CAGRA_FILTER_PASSING_TWO_HOP
+            );
+        }
+
+        for expansion in [FilterExpansion::ScoreAll, FilterExpansion::PassingTwoHop] {
+            let params = SearchParams::builder().filter_expansion(expansion).build().unwrap();
+            let read_back: FilterExpansion = unsafe { (*params.handle).filter_expansion.into() };
+            assert_eq!(read_back, expansion);
+        }
+    }
+
+    #[test]
+    fn search_params_rejects_invalid_filtering_rate() {
+        for rate in [0.0, 1.0, -0.5, 1.5, f32::NAN, f32::INFINITY] {
+            let err = SearchParams::builder().filtering_rate(rate).build().unwrap_err();
+            assert!(err.to_string().contains("filtering_rate must be in (0, 1)"));
+        }
+    }
+
+    #[test]
+    fn search_params_sets_and_resets_query_bitsets() {
+        let mut params = SearchParams::builder().build().unwrap();
+        // Only the address is stored: nothing reads through it without a search.
+        let pointers = [ptr::null::<u32>(); 2];
+
+        unsafe {
+            params.set_query_bitsets(pointers.as_ptr());
+            assert_eq!((*params.handle).query_bitsets, pointers.as_ptr() as usize);
+
+            params.set_query_bitsets(ptr::null());
+            assert_eq!((*params.handle).query_bitsets, 0);
+        }
     }
 }
