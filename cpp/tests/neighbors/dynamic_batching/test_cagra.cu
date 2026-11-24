@@ -165,8 +165,8 @@ TEST(dynamic_batching_upstream_error, every_request_throws)
 }
 
 /**
- * Batching re-lays the query rows, so upstream search parameters that hold one entry per query
- * (cagra::search_params::query_bitsets) are refused when the index is created.
+ * Batching changes the query-row mapping, so an upstream search parameter that holds one entry
+ * per query (cagra::search_params::query_bitsets) must be rejected when the index is created.
  */
 TEST(dynamic_batching_upstream_params, query_bitsets_rejected)
 {
@@ -192,7 +192,7 @@ TEST(dynamic_batching_upstream_params, query_bitsets_rejected)
   cagra::search_params upstream_params;
   EXPECT_NO_THROW(make_index(upstream_params));
 
-  // The pointer array is not read: the index is refused before any search.
+  // The pointer array is never read: index creation is rejected before any search.
   const uint32_t* const query_bitsets[] = {nullptr};
   upstream_params.query_bitsets         = query_bitsets;
   EXPECT_THROW(make_index(upstream_params), raft::logic_error);

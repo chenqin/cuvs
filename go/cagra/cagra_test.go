@@ -332,8 +332,8 @@ func TestCagraFiltering(t *testing.T) {
 		}
 	}
 
-	// Step 4: Search points 516-519 with filter and the two-hop filter expansion - they should
-	// find themselves and no filtered out point
+	// Step 4: Search points 516-519 with filter and the PASSING_TWO_HOP filter expansion - they
+	// should find themselves and no filtered-out point
 	queries3, err := cuvs.NewTensor(testDataset[(nFilteredOut + nQueries):(nFilteredOut + 2*nQueries)])
 	if err != nil {
 		t.Fatalf("error creating queries3 tensor: %v", err)

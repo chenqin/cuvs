@@ -206,9 +206,10 @@ void search_with_selective_filter(
   // A small itopk_size, as used for small k, on the MULTI_CTA algorithm that AUTO picks for a
   // handful of queries over a handful of partitions.
   cagra::search_params search_params;
-  search_params.algo             = search_algo::MULTI_CTA;
-  search_params.itopk_size       = k;
-  search_params.filtering_rate   = filtering_rate;
+  search_params.algo           = search_algo::MULTI_CTA;
+  search_params.itopk_size     = k;
+  search_params.filtering_rate = filtering_rate;
+
   search_params.filter_expansion = filter_expansion;
 
   cagra::search(
@@ -288,22 +289,23 @@ TEST(AnnCagraMultiPartition, SelectiveFilterReturnsKNeighbors)
   EXPECT_GE(recall, 0.95);
 }
 
-// Multi-partition search filters each partition by its own bitset and walks as SCORE_ALL whatever
-// filter_expansion asks for. Were PASSING_TWO_HOP to reach the search plan, the candidate list
-// would not be lengthened by the filtering rate, and this filter would leave queries short of
-// neighbors.
-TEST(AnnCagraMultiPartition, PassingTwoHopWalksAsScoreAll)
+// Multi-partition search always uses SCORE_ALL and ignores filter_expansion. If PASSING_TWO_HOP
+// reached the search plan, itopk_size would not be increased by the filtering rate and this
+// selective filter would leave queries with fewer than k neighbors.
+TEST(AnnCagraMultiPartition, SelectiveFilterReturnsKNeighborsWithPassingTwoHop)
 {
   int short_queries = 0;
   double recall     = 0;
   search_with_selective_filter(
     -1.0f, short_queries, recall, cagra::filter_expansion_mode::PASSING_TWO_HOP);
   EXPECT_EQ(short_queries, 0) << "queries returning fewer than k neighbors";
+  // The floor of SelectiveFilterReturnsKNeighbors: both tests run the same SCORE_ALL search.
   EXPECT_GE(recall, 0.95);
 }
 
-// One bitset per query belongs to single-index search: a partition is filtered by its own
-// bitset. The pointer array is not read, the search is refused before that.
+// query_bitsets is only supported by single-index search: multi-partition search filters each
+// partition by its own bitset, so the call must be rejected. The pointer array is never read
+// because the search is rejected first.
 TEST(AnnCagraMultiPartition, QueryBitsetsRejected)
 {
   const uint32_t* const query_bitsets[] = {nullptr};

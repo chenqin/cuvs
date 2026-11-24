@@ -32,13 +32,22 @@
 namespace cuvs::neighbors::cagra {
 namespace {
 
-// Clustered rows, and filters that pass whole clusters: the case PASSING_TWO_HOP is for.
+// The dataset is clustered and each filter passes whole clusters, so the rows that pass a filter
+// are close to each other. This is the case PASSING_TWO_HOP targets.
 constexpr int64_t n_rows      = 20000;
 constexpr int64_t per_cluster = 100;
 constexpr int64_t n_queries   = 32;
 constexpr int64_t k           = 10;
-// What a result slot holds when the search has no row for it.
+// MULTI_CTA writes this index to a result slot that it could not fill.
 constexpr uint32_t invalid_row = 0xffffffffu;
+// Minimum recall against the exact filtered top-k rows. PASSING_TWO_HOP is held to the higher
+// floor because the filters pass whole clusters, the case it targets. SCORE_ALL is held to a
+// lower floor on this dataset: the tests that search with it check that the filter is applied to
+// each query.
+constexpr double min_recall_two_hop   = 0.9;
+constexpr double min_recall_score_all = 0.5;
+// Filters 0 and 1 each pass one cluster in ten, so each filters out 90% of the rows.
+constexpr float known_filtering_rate = 0.9f;
 
 class CagraFilterTwoHopTest : public ::testing::Test {
  protected:
@@ -104,8 +113,8 @@ class CagraFilterTwoHopTest : public ::testing::Test {
     raft::resource::sync_stream(res);
   }
 
-  // Makes the rows whose bits are set in `words` a filter, on the host and on the device, and
-  // returns its number.
+  // Adds a filter that passes the rows whose bits are set in `words`. Keeps the words on the host
+  // and on the device and returns the index of the new filter.
   int add_filter(std::vector<uint32_t> words)
   {
     bits.push_back(raft::make_device_vector<uint32_t, int64_t>(res, words.size()));
@@ -123,7 +132,7 @@ class CagraFilterTwoHopTest : public ::testing::Test {
 
   std::set<uint32_t> exact(int f, int64_t q) const
   {
-    std::vector<std::pair<float, uint32_t>> scored;
+    std::vector<std::pair<float, uint32_t>> ranked;
     for (int64_t i = 0; i < n_rows; i++) {
       if (!passes(f, static_cast<uint32_t>(i))) { continue; }
       float dist = 0;
@@ -131,13 +140,13 @@ class CagraFilterTwoHopTest : public ::testing::Test {
         const float x = host_rows[i * n_dim + d] - host_queries[q * n_dim + d];
         dist += x * x;
       }
-      scored.emplace_back(dist, static_cast<uint32_t>(i));
+      ranked.emplace_back(dist, static_cast<uint32_t>(i));
     }
-    const auto n = std::min<int64_t>(k, scored.size());
-    std::partial_sort(scored.begin(), scored.begin() + n, scored.end());
+    const auto n = std::min<int64_t>(k, ranked.size());
+    std::partial_sort(ranked.begin(), ranked.begin() + n, ranked.end());
     std::set<uint32_t> top;
     for (int64_t i = 0; i < n; i++) {
-      top.insert(scored[i].second);
+      top.insert(ranked[i].second);
     }
     return top;
   }
@@ -148,7 +157,8 @@ class CagraFilterTwoHopTest : public ::testing::Test {
       cuvs::core::bitset_view<uint32_t, int64_t>(bits[f].data_handle(), n_rows));
   }
 
-  // One pointer per query to the words of its filter, on the device; a null pointer for filter -1.
+  // Returns a device array with one pointer per query to the words of its filter, or a null
+  // pointer for filter -1.
   template <typename FilterOf>
   raft::device_vector<uintptr_t, int64_t> query_pointers(FilterOf filter_of)
   {
@@ -190,8 +200,8 @@ class CagraFilterTwoHopTest : public ::testing::Test {
     return search(params, filter(f));
   }
 
-  // Every row returned for query q passes filter f and is returned once; returns how many of the
-  // exact answers were found.
+  // Expects every row returned for query q to pass filter f and to be returned once. Returns how
+  // many of the exact top-k rows were found.
   int64_t hits(std::vector<uint32_t> const& found, int64_t q, int f)
   {
     const auto truth = exact(f, q);
@@ -207,9 +217,10 @@ class CagraFilterTwoHopTest : public ::testing::Test {
     return n;
   }
 
-  // Every returned row passes its query's filter; returns the share of the exact answers found.
+  // Expects every returned row to pass its query's filter (see hits()). Returns the recall against
+  // the exact filtered top-k rows.
   template <typename FilterOf>
-  double check(std::vector<uint32_t> const& found, FilterOf filter_of)
+  double filtered_recall(std::vector<uint32_t> const& found, FilterOf filter_of)
   {
     int64_t n = 0;
     for (int64_t q = 0; q < n_queries; q++) {
@@ -234,15 +245,17 @@ class CagraFilterTwoHopTest : public ::testing::Test {
     return reinterpret_cast<const uint32_t* const*>(p.data_handle());
   }
 
-  // max_queries splits the call into batches of five queries, so a batch after the first finds
-  // its pointers at an offset. The filters alternate with the query number, which gives a query
-  // of every other batch another filter than the query at its place in the first batch has. One
-  // query past the first batch has a null pointer and is not filtered.
+  // max_queries = 5 splits the search into batches of five queries, so each batch after the first
+  // must read its pointers at the batch offset. The filters alternate between consecutive queries
+  // and the batch size is odd, so in every second batch a query has a different filter than the
+  // query at the same position in the first batch: reading the pointers without the offset would
+  // apply the wrong filter. One query after the first batch has a null pointer and must be
+  // searched unfiltered.
   void one_bitset_per_query_in_batches()
   {
     constexpr int64_t batch = 5;
-    // The unfiltered query is one whose nearest rows pass neither filter, so that filtering it by
-    // a pointer of another query would not go unnoticed.
+    // The unfiltered query is one whose exact nearest rows pass neither filter: if the search
+    // applied the bitset of another query to it, none of those rows could be returned.
     int64_t unfiltered = -1;
     for (int64_t q = batch; q < n_queries && unfiltered < 0; q++) {
       const auto nearest = exact(-1, q);
@@ -264,17 +277,20 @@ class CagraFilterTwoHopTest : public ::testing::Test {
     for (auto mode :
          {cagra::filter_expansion_mode::PASSING_TWO_HOP, cagra::filter_expansion_mode::SCORE_ALL}) {
       params.filter_expansion = mode;
-      params.filtering_rate   = 0.9f;
+      params.filtering_rate   = known_filtering_rate;
       params.max_iterations   = mode == cagra::filter_expansion_mode::SCORE_ALL ? 0 : 20;
       const auto found        = search(params, 0);
-      const double recall     = check(found, filter_of);
-      EXPECT_GE(recall, mode == cagra::filter_expansion_mode::SCORE_ALL ? 0.5 : 0.9);
+      const double recall     = filtered_recall(found, filter_of);
+      EXPECT_GE(recall,
+                mode == cagra::filter_expansion_mode::SCORE_ALL ? min_recall_score_all
+                                                                : min_recall_two_hop);
+      // The unfiltered query may miss at most one of its k exact nearest rows.
       EXPECT_GE(hits(found, unfiltered, -1), k - 1) << "the query with a null pointer";
     }
   }
 
-  // One allowlist per query, which the linked filter reads by the query's number: in batches of
-  // five as above, with filters that alternate with the query number.
+  // A roaring_bitmap_filter with one allowlist per query, searched in batches of five as above.
+  // The linked filter looks up the allowlist by the query id plus the batch offset.
   void one_allowlist_per_query_in_batches()
   {
     std::vector<cuvs::core::roaring_allowlist> allowlists;
@@ -298,21 +314,24 @@ class CagraFilterTwoHopTest : public ::testing::Test {
     auto params        = two_hop_params();
     params.max_queries = 5;
     const auto found   = search(params, roaring_filter);
-    EXPECT_GE(check(found, [](int64_t q) { return static_cast<int>(q % 2); }), 0.9);
+    EXPECT_GE(filtered_recall(found, [](int64_t q) { return static_cast<int>(q % 2); }),
+              min_recall_two_hop);
   }
 
-  raft::device_resources res;
+  raft::resources res;
   const int64_t n_dim;
-  std::vector<float> host_rows, host_queries;
+  std::vector<float> host_rows;
+  std::vector<float> host_queries;
   std::vector<std::vector<uint32_t>> host_bits;
-  std::optional<raft::device_matrix<float, int64_t>> dataset, queries;
+  std::optional<raft::device_matrix<float, int64_t>> dataset;
+  std::optional<raft::device_matrix<float, int64_t>> queries;
   std::vector<raft::device_vector<uint32_t, int64_t>> bits;
   std::optional<cuvs::neighbors::test::padded_device_matrix_for_cagra<float>> padded;
   std::optional<cagra::index<float, uint32_t>> index;
 };
 
 // Rows of 17 floats are not a multiple of 16 bytes wide. The search copies such queries to padded
-// rows and launches them one at a time, each launch with the number of its query as the offset.
+// rows and launches them one at a time, each launch with its query id as the batch offset.
 class CagraFilterTwoHopOddWidthTest : public CagraFilterTwoHopTest {
  protected:
   CagraFilterTwoHopOddWidthTest() : CagraFilterTwoHopTest(17) {}
@@ -321,21 +340,22 @@ class CagraFilterTwoHopOddWidthTest : public CagraFilterTwoHopTest {
 TEST_F(CagraFilterTwoHopTest, FindsFilteredNeighbors)
 {
   const auto found = search(two_hop_params(), 0);
-  EXPECT_GE(check(found, [](int64_t) { return 0; }), 0.9);
+  EXPECT_GE(filtered_recall(found, [](int64_t) { return 0; }), min_recall_two_hop);
 }
 
-TEST_F(CagraFilterTwoHopTest, ScoreAllStillWorks)
+TEST_F(CagraFilterTwoHopTest, ScoreAllFindsFilteredNeighbors)
 {
   auto params             = two_hop_params();
   params.filter_expansion = cagra::filter_expansion_mode::SCORE_ALL;
   params.max_iterations   = 0;
   const auto found        = search(params, 0);
-  EXPECT_GE(check(found, [](int64_t) { return 0; }), 0.5);
+  EXPECT_GE(filtered_recall(found, [](int64_t) { return 0; }), min_recall_score_all);
 }
 
-// The second hop reads the graph in rounds whose shape depends on the thread block size, and the
-// distances of the children it finds are computed by teams of threads.
-TEST_F(CagraFilterTwoHopTest, ThreadBlockAndTeamSizes)
+// In the second hop, the number of graph entries a thread reads per round depends on the thread
+// block size, and the distances to the child nodes are computed by teams of team_size threads.
+// The test sweeps both parameters.
+TEST_F(CagraFilterTwoHopTest, ThreadBlockAndTeamSizesFindFilteredNeighbors)
 {
   for (size_t thread_block_size : {64, 128, 256, 512, 1024}) {
     for (size_t team_size : {0, 8, 16, 32}) {
@@ -343,15 +363,16 @@ TEST_F(CagraFilterTwoHopTest, ThreadBlockAndTeamSizes)
       params.thread_block_size = thread_block_size;
       params.team_size         = team_size;
       const auto found         = search(params, 0);
-      EXPECT_GE(check(found, [](int64_t) { return 0; }), 0.9)
+      EXPECT_GE(filtered_recall(found, [](int64_t) { return 0; }), min_recall_two_hop)
         << "thread_block_size " << thread_block_size << ", team_size " << team_size;
     }
   }
 }
 
-TEST_F(CagraFilterTwoHopTest, OneBitsetPerQuery)
+TEST_F(CagraFilterTwoHopTest, QueryBitsetsFilterEachQuery)
 {
-  // Even queries take filter 0, odd ones filter 1; the filter object's own bitset is not read.
+  // Even queries use filter 0 and odd queries use filter 1. The bitset of the filter object
+  // (filter 0) is not read.
   auto filter_of       = [](int64_t q) { return static_cast<int>(q % 2); };
   auto pointers        = query_pointers(filter_of);
   auto params          = two_hop_params();
@@ -359,29 +380,36 @@ TEST_F(CagraFilterTwoHopTest, OneBitsetPerQuery)
   for (auto mode :
        {cagra::filter_expansion_mode::PASSING_TWO_HOP, cagra::filter_expansion_mode::SCORE_ALL}) {
     params.filter_expansion = mode;
-    params.filtering_rate   = 0.9f;
+    params.filtering_rate   = known_filtering_rate;
     params.max_iterations   = mode == cagra::filter_expansion_mode::SCORE_ALL ? 0 : 20;
     const auto found        = search(params, 0);
-    const double recall     = check(found, filter_of);
-    EXPECT_GE(recall, mode == cagra::filter_expansion_mode::SCORE_ALL ? 0.5 : 0.9);
+    const double recall     = filtered_recall(found, filter_of);
+    EXPECT_GE(
+      recall,
+      mode == cagra::filter_expansion_mode::SCORE_ALL ? min_recall_score_all : min_recall_two_hop);
   }
 }
 
-TEST_F(CagraFilterTwoHopTest, OneBitsetPerQueryInBatches) { one_bitset_per_query_in_batches(); }
+TEST_F(CagraFilterTwoHopTest, QueryBitsetsFollowBatchOffset) { one_bitset_per_query_in_batches(); }
 
-TEST_F(CagraFilterTwoHopOddWidthTest, OneBitsetPerQuery) { one_bitset_per_query_in_batches(); }
+TEST_F(CagraFilterTwoHopOddWidthTest, QueryBitsetsFollowBatchOffset)
+{
+  one_bitset_per_query_in_batches();
+}
 
+// Only MULTI_CTA reads query_bitsets, so a search with another algorithm must be rejected.
 TEST_F(CagraFilterTwoHopTest, QueryBitsetsNeedMultiCta)
 {
-  auto pointers        = raft::make_device_vector<uintptr_t, int64_t>(res, n_queries);
+  auto pointers        = query_pointers([](int64_t q) { return static_cast<int>(q % 2); });
   auto params          = two_hop_params();
   params.algo          = cagra::search_algo::SINGLE_CTA;
   params.query_bitsets = as_query_bitsets(pointers);
   EXPECT_THROW(search(params, 0), raft::exception);
 }
 
-// SCORE_ALL lengthens its candidate list by the filtering rate, which cannot be counted from the
-// filter object's bitset when every query brings its own.
+// With SCORE_ALL, itopk_size is increased by the filtering rate. With query_bitsets the rate
+// cannot be computed from the bitset of the filter object, so the search must be rejected unless
+// filtering_rate is set.
 TEST_F(CagraFilterTwoHopTest, QueryBitsetsNeedFilteringRateForScoreAll)
 {
   auto pointers           = query_pointers([](int64_t q) { return static_cast<int>(q % 2); });
@@ -391,14 +419,15 @@ TEST_F(CagraFilterTwoHopTest, QueryBitsetsNeedFilteringRateForScoreAll)
   EXPECT_THROW(search(params, 0), raft::logic_error);
 }
 
-// The per-query bitsets stand in for the bitset of a bitset_filter of 32-bit words.
+// query_bitsets replaces the bitset of a bitset_filter with standard 32-bit packing, so the search
+// must be given such a filter.
 TEST_F(CagraFilterTwoHopTest, QueryBitsetsNeedBitsetFilter)
 {
   auto pointers        = query_pointers([](int64_t q) { return static_cast<int>(q % 2); });
   auto params          = two_hop_params();
   params.query_bitsets = as_query_bitsets(pointers);
 
-  // No filter object. When the algorithm is left to AUTO, whichever one it picks refuses.
+  // No filter. With algo = AUTO the search must be rejected too, whichever algorithm is selected.
   cuvs::neighbors::filtering::none_sample_filter no_filter;
   EXPECT_THROW(search(params, no_filter), raft::logic_error);
   params.algo = cagra::search_algo::AUTO;
@@ -410,14 +439,14 @@ TEST_F(CagraFilterTwoHopTest, QueryBitsetsNeedBitsetFilter)
     "__device__ bool cuvs_filter_udf(uint32_t, source_index_t, void*) { return true; }");
   EXPECT_THROW(search(params, udf_filter), raft::logic_error);
 
-  // A bitset whose words are not read as 32-bit words.
+  // A bitset_filter without standard 32-bit packing: its bitset is declared with 8-bit words.
   cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t> bytes_filter(
     cuvs::core::bitset_view<uint32_t, int64_t>(bits[0].data_handle(), n_rows, 8));
   EXPECT_THROW(search(params, bytes_filter), raft::logic_error);
 }
 
-// Six rows of one cluster pass, each within two hops of the others.
-TEST_F(CagraFilterTwoHopTest, FewerPassingRowsThanNeighbors)
+// Only six rows, all in one cluster, pass the filter: fewer than k.
+TEST_F(CagraFilterTwoHopTest, FewerPassingRowsThanKReturnsAllOfThem)
 {
   const std::vector<uint32_t> rows = {4203, 4217, 4230, 4244, 4268, 4291};
   std::vector<uint32_t> words((n_rows + 31) / 32, 0u);
@@ -426,7 +455,8 @@ TEST_F(CagraFilterTwoHopTest, FewerPassingRowsThanNeighbors)
   }
   const auto found = search(two_hop_params(), add_filter(std::move(words)));
   for (int64_t q = 0; q < n_queries; q++) {
-    // The passing rows come first, nearest first, and the slots after them hold no row.
+    // The first rows.size() slots must hold exactly the passing rows and the other slots must be
+    // empty. The rows are sorted before the comparison, so their order is not checked.
     std::vector<uint32_t> returned(found.begin() + q * k, found.begin() + q * k + rows.size());
     std::sort(returned.begin(), returned.end());
     EXPECT_EQ(returned, rows) << "query " << q;
@@ -436,16 +466,16 @@ TEST_F(CagraFilterTwoHopTest, FewerPassingRowsThanNeighbors)
   }
 }
 
-TEST_F(CagraFilterTwoHopTest, NoPassingRow)
+TEST_F(CagraFilterTwoHopTest, NoPassingRowReturnsNoNeighbors)
 {
   const int f      = add_filter(std::vector<uint32_t>((n_rows + 31) / 32, 0u));
   const auto found = search(two_hop_params(), f);
   EXPECT_EQ(std::count(found.begin(), found.end(), invalid_row), n_queries * k);
 }
 
-// A filter that is not a bitset of 32-bit words is called for every node the walk examines, and
-// the start nodes are drawn by testing random nodes with it.
-TEST_F(CagraFilterTwoHopTest, BloomFilter)
+// For a filter that is not a bitset with standard 32-bit packing, PASSING_TWO_HOP calls the
+// linked filter for every node it examines and selects its seeds by testing random nodes with it.
+TEST_F(CagraFilterTwoHopTest, BloomFilterFindsFilteredNeighbors)
 {
   auto stream = raft::resource::get_cuda_stream(res);
   std::vector<uint32_t> host_all_rows(n_rows);
@@ -459,13 +489,15 @@ TEST_F(CagraFilterTwoHopTest, BloomFilter)
   raft::copy(all_rows.data_handle(), host_all_rows.data(), host_all_rows.size(), stream);
   raft::copy(added.data_handle(), host_added.data(), host_added.size(), stream);
 
-  // The rows of filter 0. A false positive would be a passing row on its own among rejected
-  // ones, which the walk reaches only when it starts there: the filter is sized to have none.
+  // A bloom filter over the rows of filter 0. Its target false-positive rate (1e-6) is low enough
+  // that no false positive is expected: one would be a passing row surrounded by filtered-out
+  // rows, which PASSING_TWO_HOP may not reach.
   cuvs::core::bloom_filter bloom(
     res, n_rows, static_cast<float>(host_added.size()) / static_cast<float>(n_rows), 1e-6f);
   bloom.add(res, raft::make_const_mdspan(added.view()));
 
-  // What the bloom filter passes is what it says it contains.
+  // Build the reference filter from what the bloom filter reports as contained, so that a false
+  // positive counts as a passing row.
   auto contained = raft::make_device_vector<uint8_t, int64_t>(res, n_rows);
   bloom.contains(res, raft::make_const_mdspan(all_rows.view()), contained.view());
   std::vector<uint8_t> host_contained(n_rows);
@@ -478,51 +510,60 @@ TEST_F(CagraFilterTwoHopTest, BloomFilter)
   const int f = add_filter(std::move(words));
 
   const auto found = search(two_hop_params(), cuvs::neighbors::filtering::bloom_filter(bloom));
-  EXPECT_GE(check(found, [f](int64_t) { return f; }), 0.9);
+  EXPECT_GE(filtered_recall(found, [f](int64_t) { return f; }), min_recall_two_hop);
 }
 
-TEST_F(CagraFilterTwoHopTest, RoaringBitmapFilter) { one_allowlist_per_query_in_batches(); }
+TEST_F(CagraFilterTwoHopTest, RoaringBitmapFilterFollowsBatchOffset)
+{
+  one_allowlist_per_query_in_batches();
+}
 
-TEST_F(CagraFilterTwoHopOddWidthTest, RoaringBitmapFilter) { one_allowlist_per_query_in_batches(); }
+TEST_F(CagraFilterTwoHopOddWidthTest, RoaringBitmapFilterFollowsBatchOffset)
+{
+  one_allowlist_per_query_in_batches();
+}
 
-// The words of filter 0 declared as a bitset of bytes pass the same rows, but the kernel does not
-// read such a bitset itself: it calls the linked filter.
-TEST_F(CagraFilterTwoHopTest, BitsetOfBytes)
+// The words of filter 0 declared as a bitset of 8-bit words pass the same rows. The kernel does
+// not read the words of such a bitset directly: it calls the linked filter.
+TEST_F(CagraFilterTwoHopTest, BitsetOfBytesFindsFilteredNeighbors)
 {
   cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t> bytes_filter(
     cuvs::core::bitset_view<uint32_t, int64_t>(bits[0].data_handle(), n_rows, 8));
   const auto found = search(two_hop_params(), bytes_filter);
-  EXPECT_GE(check(found, [](int64_t) { return 0; }), 0.9);
+  EXPECT_GE(filtered_recall(found, [](int64_t) { return 0; }), min_recall_two_hop);
 }
 
-// PASSING_TWO_HOP and query_bitsets take MULTI_CTA when the algorithm is left to AUTO. The batch
-// is made large enough for AUTO to take SINGLE_CTA when a search asks for neither: SINGLE_CTA
-// would walk as SCORE_ALL, which does not reach this recall here, and would refuse the bitsets.
+// With algo = AUTO, PASSING_TWO_HOP and query_bitsets each select MULTI_CTA. max_queries is set
+// so that AUTO would otherwise select SINGLE_CTA (itopk_size <= 512 and max_queries >= twice the
+// number of SMs). SINGLE_CTA rejects query_bitsets, so the second search succeeding shows that
+// MULTI_CTA was selected. For the first search the evidence is indirect: SINGLE_CTA would search
+// with SCORE_ALL, which is not expected to reach the PASSING_TWO_HOP recall floor on this dataset.
 TEST_F(CagraFilterTwoHopTest, AutoSelectsMultiCta)
 {
   auto params        = two_hop_params();
   params.algo        = cagra::search_algo::AUTO;
   params.max_queries = 2 * raft::resource::get_device_properties(res).multiProcessorCount;
-  EXPECT_GE(check(search(params, 0), [](int64_t) { return 0; }), 0.9);
+  EXPECT_GE(filtered_recall(search(params, 0), [](int64_t) { return 0; }), min_recall_two_hop);
 
   auto filter_of          = [](int64_t q) { return static_cast<int>(q % 2); };
   auto pointers           = query_pointers(filter_of);
   params.filter_expansion = cagra::filter_expansion_mode::SCORE_ALL;
   params.max_iterations   = 0;
-  params.filtering_rate   = 0.9f;
+  params.filtering_rate   = known_filtering_rate;
   params.query_bitsets    = as_query_bitsets(pointers);
-  EXPECT_GE(check(search(params, 0), filter_of), 0.5);
+  EXPECT_GE(filtered_recall(search(params, 0), filter_of), min_recall_score_all);
 }
 
-// Another algorithm than MULTI_CTA walks as SCORE_ALL, with a warning.
-TEST_F(CagraFilterTwoHopTest, OtherAlgorithmsScoreAll)
+// SINGLE_CTA and MULTI_KERNEL do not implement PASSING_TWO_HOP: the search logs a warning and uses
+// SCORE_ALL. Only the filter is checked here: every valid row returned must pass it.
+TEST_F(CagraFilterTwoHopTest, OtherAlgorithmsReturnOnlyPassingRows)
 {
   for (auto algo : {cagra::search_algo::SINGLE_CTA, cagra::search_algo::MULTI_KERNEL}) {
     auto params           = two_hop_params();
     params.algo           = algo;
     params.max_iterations = 0;
     for (auto row : search(params, 0)) {
-      // These algorithms do not all mark a slot without a row as MULTI_CTA does.
+      // These algorithms do not all write invalid_row to a result slot that they could not fill.
       if (row < n_rows) { EXPECT_TRUE(passes(0, row)) << "returned row " << row; }
     }
   }

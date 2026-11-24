@@ -257,7 +257,8 @@ def calc_filtered_recall(dataset, queries, neighbors, masks):
 def test_cagra_filter_expansion_two_hop(
     n_rows=10000, n_cols=10, n_queries=100, k=10, per_cluster=100
 ):
-    # Clustered rows and a filter that passes whole clusters
+    # Clustered rows and a filter that passes whole clusters, so the rows
+    # that pass the filter are close to each other
     n_clusters = n_rows // per_cluster
     centers = np.random.uniform(-1, 1, (n_clusters, n_cols))
     dataset = np.repeat(centers, per_cluster, axis=0)

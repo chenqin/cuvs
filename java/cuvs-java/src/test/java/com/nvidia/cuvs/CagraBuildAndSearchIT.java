@@ -693,7 +693,7 @@ public class CagraBuildAndSearchIT extends CuVSTestCase {
 
   /**
    * A test that checks pre-filtering with the PASSING_TWO_HOP filter expansion, where a MULTI_CTA
-   * search walks the graph only through the rows that pass the prefilter.
+   * search computes distances only to the rows that pass the prefilter.
    */
   @Test
   public void testPrefilteringWithPassingTwoHop() throws Throwable {

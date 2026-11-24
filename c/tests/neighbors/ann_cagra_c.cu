@@ -1002,9 +1002,9 @@ TEST(CagraC, BuildSearchFiltered)
   cuvsResourcesDestroy(res);
 }
 
-// The filter parameters of cuvsCagraSearchParams: a given filtering rate, the walk through passing
-// rows only, and one bitset per query.
-TEST(CagraC, BuildSearchFilterExpansion)
+// The filter parameters of cuvsCagraSearchParams: filtering_rate, filter_expansion
+// (CUVS_CAGRA_FILTER_PASSING_TWO_HOP) and query_bitsets (one bitset per query).
+TEST(CagraC, BuildSearchFilterExpansionAndQueryBitsets)
 {
   cuvsResources_t res;
   cuvsResourcesCreate(&res);
@@ -1050,7 +1050,7 @@ TEST(CagraC, BuildSearchFilterExpansion)
   auto neighbors_tensor = make_device_matrix_tensor(neighbors_d.data(), n_queries, k);
   auto distances_tensor = make_device_matrix_tensor(distances_d.data(), n_queries, k);
 
-  // `filter` keeps rows 0 and 3; `other_filter` keeps rows 1 and 2.
+  // `filter` passes rows 0 and 3; `other_filter` passes rows 1 and 2.
   uint32_t other_filter[1] = {0b0110};
   rmm::device_uvector<uint32_t> filter_d(1, stream);
   rmm::device_uvector<uint32_t> other_filter_d(1, stream);
@@ -1072,25 +1072,28 @@ TEST(CagraC, BuildSearchFilterExpansion)
 
   cuvsCagraSearchParams_t search_params;
   cuvsCagraSearchParamsCreate(&search_params);
-  // By default the rate is automatic, the walk is SCORE_ALL and no query has its own bitset.
+  // Defaults: automatic filtering rate (0), CUVS_CAGRA_FILTER_SCORE_ALL and no per-query bitsets.
   ASSERT_EQ(search_params->filtering_rate, 0.0f);
   ASSERT_EQ(search_params->filter_expansion, CUVS_CAGRA_FILTER_SCORE_ALL);
   ASSERT_EQ(search_params->query_bitsets, (uintptr_t)0);
 
-  // Walking through passing rows only finds the same neighbors, and needs no rate.
+  // CUVS_CAGRA_FILTER_PASSING_TWO_HOP finds the same neighbors and does not need a filtering
+  // rate. cuvsCagraSearchParamsCreate leaves algo at SINGLE_CTA, so algo is set to MULTI_CTA.
   search_params->algo             = MULTI_CTA;
   search_params->filter_expansion = CUVS_CAGRA_FILTER_PASSING_TWO_HOP;
   ASSERT_EQ(search(search_params), CUVS_SUCCESS);
   expect_filtered_results();
 
-  // One bitset per query: queries 0 and 1 keep rows 1 and 2, query 2 keeps rows 0 and 3, and
-  // the null pointer leaves query 3 unfiltered. The bitset of `prefilter` is not read.
+  // One bitset per query: rows 1 and 2 pass for queries 0 and 1, rows 0 and 3 pass for query 2,
+  // and the null pointer leaves query 3 unfiltered. The bitset of `prefilter` is not read.
   uintptr_t bitset_pointers[4] = {(uintptr_t)other_filter_d.data(),
                                   (uintptr_t)other_filter_d.data(),
                                   (uintptr_t)filter_d.data(),
                                   (uintptr_t)0};
   rmm::device_uvector<uintptr_t> bitset_pointers_d(n_queries, stream);
   raft::copy(bitset_pointers_d.data(), bitset_pointers, n_queries, stream);
+  // Queries 0 and 1 return row 2, the nearer of rows 1 and 2. Query 2 returns row 3, as in
+  // neighbors_exp_filtered, and query 3 returns row 1, as in neighbors_exp.
   uint32_t neighbors_exp_per_query[4] = {2, 2, 3, 1};
   float distances_exp_per_query[4]    = {0.35904629, 0.21700793, 0.04776672, 0.15224178};
   auto expect_per_query_results       = [&]() {
@@ -1103,15 +1106,15 @@ TEST(CagraC, BuildSearchFilterExpansion)
   ASSERT_EQ(search(search_params), CUVS_SUCCESS);
   expect_per_query_results();
 
-  // The SCORE_ALL walk lengthens its candidate list by the filtering rate, which is not counted
-  // from one bitset per query: the search fails until the rate is given.
+  // With CUVS_CAGRA_FILTER_SCORE_ALL, itopk_size is increased by the filtering rate, which is
+  // not computed from per-query bitsets: the search must fail until filtering_rate is set.
   search_params->filter_expansion = CUVS_CAGRA_FILTER_SCORE_ALL;
   ASSERT_EQ(search(search_params), CUVS_ERROR);
   search_params->filtering_rate = 0.5f;
   ASSERT_EQ(search(search_params), CUVS_SUCCESS);
   expect_per_query_results();
 
-  // Only MULTI_CTA reads one bitset per query; any other algorithm must fail, not ignore them.
+  // Only MULTI_CTA reads query_bitsets; any other algorithm must fail instead of ignoring them.
   search_params->algo = SINGLE_CTA;
   ASSERT_EQ(search(search_params), CUVS_ERROR);
 

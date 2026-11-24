@@ -634,7 +634,8 @@ mod tests {
         tensor.as_dl_tensor().unwrap().to_c().inner.dl_tensor.data as usize
     }
 
-    /// Test the two-hop filtered walk: exclude odd-indexed rows, verify they don't appear.
+    /// Test bitset-filtered search with `FilterExpansion::PassingTwoHop`: exclude odd-indexed
+    /// rows, verify they don't appear.
     #[test]
     fn test_cagra_search_filtered_passing_two_hop() {
         let res = Resources::new().unwrap();

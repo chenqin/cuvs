@@ -76,31 +76,36 @@ func TestSearchParamsSetFilterExpansion(t *testing.T) {
 	testCases := []struct {
 		name          string
 		expansion     FilterExpansion
-		expected      uint32
+		expected      uint32 // ignored when expectedError is set
 		expectedError bool
 	}{
 		{"PASSING_TWO_HOP expansion", FilterExpansionPassingTwoHop, 1, false},
-		{"Invalid expansion", FilterExpansion(999), 1, true},
+		{"Invalid expansion", FilterExpansion(999), 0, true},
 		{"SCORE_ALL expansion", FilterExpansionScoreAll, 0, false},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			previous := uint32(params.params.filter_expansion)
 			result, err := params.SetFilterExpansion(tc.expansion)
 
 			if tc.expectedError {
 				if err == nil {
 					t.Error("Expected error for invalid filter_expansion, got none")
 				}
-			} else {
-				if err != nil {
-					t.Errorf("SetFilterExpansion failed: %v", err)
+				// An invalid value leaves the previous one in place
+				if uint32(params.params.filter_expansion) != previous {
+					t.Errorf("Expected filter_expansion to stay %d, got %d",
+						previous, params.params.filter_expansion)
 				}
-				if result != params {
-					t.Error("SetFilterExpansion should return the same params instance")
-				}
+				return
 			}
-			// An invalid value leaves the previous one in place
+			if err != nil {
+				t.Errorf("SetFilterExpansion failed: %v", err)
+			}
+			if result != params {
+				t.Error("SetFilterExpansion should return the same params instance")
+			}
 			if uint32(params.params.filter_expansion) != tc.expected {
 				t.Errorf("Expected filter_expansion %d, got %d",
 					tc.expected, params.params.filter_expansion)

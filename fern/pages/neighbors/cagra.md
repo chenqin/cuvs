@@ -744,7 +744,7 @@ fn export_cagra_as_hnswlib(dataset: &ndarray::Array2<f32>) -> Result<()> {
 
 CAGRA supports filtered search. A filter hides some vectors from the search result, so CAGRA may need to explore more of the graph to find enough valid neighbors.
 
-CAGRA can adjust `itopk_size` internally based on the filtering rate. To disable this automatic adjustment in C++, set `filtering_rate` to `0.0`. In the C API and the language bindings built on it, `0` selects the automatic rate; pass the known rate instead. When a filter removes most of the index, see [Filter expansion](#filter-expansion) for a search that only scores and expands vectors the filter passes.
+CAGRA can adjust `itopk_size` internally based on the filtering rate. To disable this automatic adjustment in C++, set `filtering_rate` to `0.0`. In the C API and the language bindings built on it, `0` is the default and lets NVIDIA cuVS estimate the rate, as negative values do in C++; set `filtering_rate` to the known rate to skip the estimate. When the vectors that pass a filter are a small part of the index and are close to each other in the graph, see [Filter expansion](#filter-expansion) for a search mode that computes distances only to the vectors that pass the filter.
 
 The examples below use a bitset filter. A bit value of `1` means a vector is allowed; a bit value of `0` means it is filtered out.
 
@@ -950,27 +950,39 @@ if err != nil {
 
 ### Filter expansion
 
-By default, a filtered search scores every neighbor of each vertex it visits, whether or not that neighbor passes the filter, and removes the filtered-out vectors from the result. With `MULTI_CTA`, CAGRA lengthens `itopk_size` by the filtering rate to make up for the candidates it will drop. When a filter removes most of the index, nearly all of the distance computations are then spent on vectors that cannot be returned.
+In each iteration, a CAGRA search takes parent nodes from its internal top-k list and examines the neighbors of each parent node to find its child nodes, the vectors it computes distances to. By default, a filtered search computes the distance to every neighbor of a parent node, whether or not that neighbor passes the filter, and removes the filtered-out vectors from the result. With `MULTI_CTA`, `itopk_size` is increased by the filtering rate to make up for the vectors that will be removed. When a filter removes most of the index, most of the distance computations are spent on vectors that cannot be returned.
 
-`filter_expansion` selects how the `MULTI_CTA` algorithm walks the graph when a filter is given. `PASSING_TWO_HOP` selects `MULTI_CTA` when `algo` is `AUTO`; the other algorithms ignore it. The C API's default `algo` is `SINGLE_CTA`, so set `algo` there.
+`filter_expansion` selects how a filtered `MULTI_CTA` search traverses the graph.
 
 | Value | Behavior |
 | --- | --- |
-| `SCORE_ALL` (default) | Every neighbor is scored and can be expanded in turn. Filtered-out vectors are dropped from the result. |
-| `PASSING_TWO_HOP` | Only vectors that pass the filter are scored, kept, and expanded. A filtered-out neighbor is not scored; its own neighbors are examined instead, so the candidates of a vertex are its passing neighbors and the passing neighbors of its filtered-out neighbors, up to about `graph_degree` of them per expansion. |
+| `SCORE_ALL` (default) | The distance is computed to every neighbor of a parent node, and each of them can become a parent node in turn. Filtered-out vectors are removed from the result. |
+| `PASSING_TWO_HOP` | The distance is computed only to vectors that pass the filter, and only those vectors are kept in the internal top-k list and become parent nodes. A filtered-out neighbor is used as a bridge: no distance is computed to it, and its own neighbors are examined instead. The child nodes of a parent node are its neighbors that pass the filter and the neighbors of its bridges that pass the filter, up to about `graph_degree` child nodes per parent node. |
+
+Only `MULTI_CTA` implements `PASSING_TWO_HOP`:
+
+- When `algo` is `AUTO`, `PASSING_TWO_HOP` selects `MULTI_CTA`, unless `persistent` is set.
+- The other algorithms ignore `PASSING_TWO_HOP`: the search logs a warning and uses `SCORE_ALL`.
+- Search parameters created by `cuvsCagraSearchParamsCreate` have `algo` set to `SINGLE_CTA`. In C, and in the Rust and Go bindings, which keep this default, set `algo` to `MULTI_CTA` (or `AUTO`) for `PASSING_TWO_HOP` to take effect. Python and Java default to `AUTO`.
+- Multi-partition search always uses `SCORE_ALL`.
 
 With `PASSING_TWO_HOP`:
 
-- The search starts from random vectors that pass the filter. For each starting slot, `num_random_samplings` of them are drawn and the nearest is kept, so a larger value starts the search closer to the query.
-- `itopk_size` is not lengthened, and the filtering rate is neither needed nor computed. The work a query does no longer depends on the filtering rate: it is set by the same parameters as an unfiltered `MULTI_CTA` search (`itopk_size`, `search_width`, `max_iterations`) and by `num_random_samplings`.
-- It suits filters that remove most of the index, and is most effective when the vectors a filter passes are near each other. If so few vectors pass that none lies within two hops of another (fewer than about one vector in `graph_degree * graph_degree`), the search cannot leave its starting points; run an exact search over the passing vectors instead. For the same reason, a passing vector that stands alone among filtered-out vectors, such as a false positive of a bloom filter, is found only when the search starts on it.
-- Multi-partition search always uses `SCORE_ALL`.
+- The initial random seed nodes are vectors that pass the filter. Each seed is the nearest of `num_random_samplings` random vectors that pass the filter, so a larger value gives seeds that are closer to the query.
+- `itopk_size` is not increased by the filtering rate, and the filtering rate of a bitset filter is not computed.
+- The search is tuned with the same parameters as an unfiltered `MULTI_CTA` search (`itopk_size`, `search_width`, `max_iterations`) and with `num_random_samplings`.
+
+`PASSING_TWO_HOP` is an opt-in mode for filters whose passing vectors are close to each other in the graph, such as a filter on an attribute that similar vectors share. A parent node then has vectors that pass the filter among its neighbors and the neighbors of its bridges, and the search moves toward the query through them.
+
+Do not use `PASSING_TWO_HOP` when the vectors that pass the filter are spread uniformly over the index at a low rate. The search reaches a vector only if it passes the filter and is within two hops of a parent node, and no distance is computed to a bridge, so the search cannot tell which bridge leads toward the query. When fewer than roughly one vector in `graph_degree * graph_degree` passes the filter, or the passing vectors are spread so that few of them are within two hops of each other, a parent node has few or no child nodes, the search cannot move beyond its seeds, and recall is low. For the same reason, an isolated vector that passes the filter among filtered-out vectors, such as a false positive of a bloom filter, may not be found. For such filters, use `SCORE_ALL`, which traverses the graph regardless of the filter, or an exact search such as `brute_force::search` with a bitset filter (see [Brute-force](/user-guide/api-guides/indexing-guide/brute-force#using-filters)).
 
 <Tabs>
 <Tab title="C">
 
 ```c
 cuvsCagraSearchParamsCreate(&search_params);
+// cuvsCagraSearchParamsCreate leaves algo at SINGLE_CTA, which ignores
+// CUVS_CAGRA_FILTER_PASSING_TWO_HOP: set algo to MULTI_CTA (or AUTO).
 search_params->algo = MULTI_CTA;
 search_params->filter_expansion = CUVS_CAGRA_FILTER_PASSING_TWO_HOP;
 
@@ -1015,6 +1027,18 @@ CagraSearchParams searchParams =
         .withAlgo(CagraSearchParams.SearchAlgo.MULTI_CTA)
         .withFilterExpansion(CagraSearchParams.FilterExpansion.PASSING_TWO_HOP)
         .build();
+
+try (CuVSMatrix queryVectors = loadQueryMatrix()) {
+  CagraQuery cuvsQuery =
+      new CagraQuery.Builder(resources)
+          .withTopK(10)
+          .withSearchParams(searchParams)
+          .withQueryVectors(queryVectors)
+          .withPrefilter(prefilter, numDocs)
+          .build();
+
+  SearchResults results = index.search(cuvsQuery);
+}
 ```
 
 </Tab>
@@ -1023,6 +1047,7 @@ CagraSearchParams searchParams =
 ```rust
 use cuvs::neighbors::cagra::{FilterExpansion, SearchAlgo, SearchParams};
 
+// The builder leaves `algo` at SINGLE_CTA unless it is set.
 let search_params = SearchParams::builder()
     .algo(SearchAlgo::MultiCta)
     .filter_expansion(FilterExpansion::PassingTwoHop)
@@ -1041,10 +1066,24 @@ if err != nil {
 }
 defer searchParams.Close()
 
+// CreateSearchParams leaves the algorithm at SINGLE_CTA unless it is set.
 if _, err = searchParams.SetAlgo(cagra.SearchAlgoMultiCta); err != nil {
 	return err
 }
 if _, err = searchParams.SetFilterExpansion(cagra.FilterExpansionPassingTwoHop); err != nil {
+	return err
+}
+
+err = cagra.SearchIndex(
+	resource,
+	searchParams,
+	index,
+	&queries,
+	&neighbors,
+	&distances,
+	allowList,
+)
+if err != nil {
 	return err
 }
 ```
@@ -1054,13 +1093,16 @@ if _, err = searchParams.SetFilterExpansion(cagra.FilterExpansionPassingTwoHop);
 
 ### One bitset per query
 
-A bitset filter applies the same bitset to every query of a search call. When the queries of a batch have different filters, `query_bitsets` lets them share one `MULTI_CTA` search call. It is a device array with one pointer per query, each to the 32-bit words of that query's own bitset over the indexed vectors. As in a bitset filter, bit `i % 32` of word `i / 32` is set when vector `i` is allowed. Queries may share a bitset, and a null pointer leaves a query unfiltered.
+A bitset filter applies the same bitset to every query of a search call. When the queries of a batch have different filters, `query_bitsets` lets them share one `MULTI_CTA` search call. It is a device array with one pointer per query, each to the words of that query's bitset over the indexed vectors. The bitsets use the standard 32-bit packing of a bitset filter: bit `i % 32` of word `i / 32` is set when vector `i` is allowed. Queries may share a bitset, and a null pointer leaves that query unfiltered.
 
-- Pass a bitset filter to the search call as usual. It selects the filtered search, but its own bitset is not read.
+- Pass a bitset filter with standard 32-bit packing to the search call as usual. It selects the filtered search, but its own bitset is not read.
 - The array must hold a pointer for every query of the call.
-- `algo` must be `MULTI_CTA`, or `AUTO`, which then selects it. The search fails with any other algorithm, and multi-partition search, tiered-index search and dynamic batching do not accept `query_bitsets`.
-- Set `filter_expansion` to `PASSING_TWO_HOP`, or give `filtering_rate`: a rate is not computed from per-query bitsets.
-- The pointer array and every bitset it points to must stay valid until the search has finished its work on the stream.
+- `algo` must be `MULTI_CTA`, or `AUTO`, which then selects `MULTI_CTA` unless `persistent` is set. The search fails with any other algorithm. Search parameters created by `cuvsCagraSearchParamsCreate` have `algo` set to `SINGLE_CTA`, so in C, Rust, and Go, set `algo` to `MULTI_CTA` (or `AUTO`).
+- With `SCORE_ALL`, `filtering_rate` must be set, because the rate is not computed from per-query bitsets. `PASSING_TWO_HOP` does not need it.
+- Multi-partition search, tiered-index search, and dynamic batching reject `query_bitsets`.
+- The pointer array and every bitset it points to must stay valid until the search has completed its work on the CUDA stream.
+
+Python accepts the device address of the pointer array or a one-dimensional device array of `uint64` addresses, such as a CuPy array. Rust (`SearchParams::set_query_bitsets`), Java (`CagraSearchParams.Builder.withQueryBitsets`), and Go (`SearchParams.SetQueryBitsets`) take the device address of the pointer array.
 
 <Tabs>
 <Tab title="C">
@@ -1068,6 +1110,7 @@ A bitset filter applies the same bitset to every query of a search call. When th
 ```c
 // `bitset_pointers` is a device array of n_queries pointers, each to the uint32
 // words of one query's bitset on the same device.
+// cuvsCagraSearchParamsCreate leaves algo at SINGLE_CTA: set it to MULTI_CTA.
 search_params->algo = MULTI_CTA;
 search_params->filter_expansion = CUVS_CAGRA_FILTER_PASSING_TWO_HOP;
 search_params->query_bitsets = (uintptr_t)bitset_pointers;
@@ -1098,6 +1141,34 @@ search_params.query_bitsets    = reinterpret_cast<const uint32_t* const*>(pointe
 
 auto bitset_filter = cuvs::neighbors::filtering::bitset_filter(bitsets[0].view());
 cagra::search(res, search_params, index, queries, neighbors, distances, bitset_filter);
+```
+
+</Tab>
+<Tab title="Python">
+
+```python
+import cupy as cp
+from cuvs.neighbors import cagra, filters
+
+# `bitsets` holds one CuPy uint32 bitset per distinct filter, and
+# `filter_of_query[i]` is the position of the bitset of query i in it.
+query_bitsets = cp.array(
+    [bitsets[f].data.ptr for f in filter_of_query], dtype=cp.uint64
+)
+
+search_params = cagra.SearchParams(
+    algo="multi_cta",
+    filter_expansion="passing_two_hop",
+    query_bitsets=query_bitsets,
+)
+
+distances, neighbors = cagra.search(
+    search_params,
+    index,
+    queries,
+    k,
+    filter=filters.from_bitset(bitsets[0]),
+)
 ```
 
 </Tab>

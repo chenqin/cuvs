@@ -181,18 +181,21 @@ class CagraUdfFilterTest : public ::testing::TestWithParam<cagra::search_algo> {
   std::optional<cagra::device_padded_index<float, uint32_t>> index = std::nullopt;
 };
 
-// MULTI_CTA searches that walk through passing nodes only (PASSING_TWO_HOP). The walk calls the
-// linked predicate for every node it examines and draws its start nodes by testing random nodes
-// with it.
+// MULTI_CTA searches with filter_expansion = PASSING_TWO_HOP. This mode calls the linked predicate
+// for every node it examines and selects its seeds by testing random nodes with the predicate.
 class CagraUdfFilterTwoHopTest : public CagraUdfFilterTest {
  protected:
+  // Minimum recall against each query's exact nearest passing rows (see recall()). The same floor
+  // as the PASSING_TWO_HOP tests in test_filter_two_hop.cu.
+  static constexpr double min_recall = 0.9;
+
   cagra_search_result two_hop_search(cuvs::neighbors::filtering::base_filter const& filter)
   {
     return search(filter, -1.0f, cagra::filter_expansion_mode::PASSING_TWO_HOP);
   }
 
-  // Every returned row passes `passes(query, row)`; returns the share found of each query's
-  // nearest passing rows.
+  // Expects every returned row to satisfy `passes(query, row)`. Returns the recall against each
+  // query's exact nearest passing rows.
   template <typename Passes>
   double recall(cagra_search_result const& result, Passes passes)
   {
@@ -206,7 +209,7 @@ class CagraUdfFilterTwoHopTest : public CagraUdfFilterTest {
     size_t n_found    = 0;
     size_t n_expected = 0;
     for (int64_t q = 0; q < n_queries; ++q) {
-      std::vector<std::pair<float, uint32_t>> scored;
+      std::vector<std::pair<float, uint32_t>> ranked;
       for (int64_t row = 0; row < n_rows; ++row) {
         if (!passes(q, row)) { continue; }
         float distance = 0;
@@ -214,18 +217,18 @@ class CagraUdfFilterTwoHopTest : public CagraUdfFilterTest {
           float const diff = host_dataset[row * n_dim + d] - host_queries[q * n_dim + d];
           distance += diff * diff;
         }
-        scored.emplace_back(distance, static_cast<uint32_t>(row));
+        ranked.emplace_back(distance, static_cast<uint32_t>(row));
       }
-      auto const n_nearest = std::min<size_t>(k, scored.size());
-      std::partial_sort(scored.begin(), scored.begin() + n_nearest, scored.end());
+      auto const n_nearest = std::min<size_t>(k, ranked.size());
+      std::partial_sort(ranked.begin(), ranked.begin() + n_nearest, ranked.end());
       n_expected += n_nearest;
       for (int64_t i = 0; i < k; ++i) {
         auto const source_id = result.neighbors[static_cast<size_t>(q * k + i)];
         if (source_id >= static_cast<uint32_t>(n_rows)) { continue; }
         EXPECT_TRUE(passes(q, static_cast<int64_t>(source_id)))
           << "query " << q << " returned row " << source_id;
-        n_found += std::any_of(scored.begin(),
-                               scored.begin() + n_nearest,
+        n_found += std::any_of(ranked.begin(),
+                               ranked.begin() + n_nearest,
                                [source_id](auto const& s) { return s.second == source_id; });
       }
     }
@@ -509,24 +512,27 @@ TEST_P(CagraUdfFilterTest, TenantContextHonorsQuerySpecificMetadata)
   }
 }
 
-TEST_P(CagraUdfFilterTwoHopTest, PredicateWithoutFilterData)
+TEST_P(CagraUdfFilterTwoHopTest, HighFilteringRateFindsNearestValidNeighbors)
 {
   cuvs::neighbors::filtering::udf_filter udf_filter(
     high_filtering_rate_udf_source(), nullptr, high_filtering_rate);
   auto result = two_hop_search(udf_filter);
   EXPECT_GE(recall(result, [](int64_t, int64_t row) { return row >= high_filtering_threshold; }),
-            0.9);
+            min_recall);
+}
 
-  // A predicate that passes no row gives the walk no start node.
+// A predicate that passes no row leaves the search without seeds.
+TEST_P(CagraUdfFilterTwoHopTest, RejectAllReturnsNoValidNeighbors)
+{
   cuvs::neighbors::filtering::udf_filter reject_all(reject_all_udf_source(), nullptr, 0.999f);
   for (auto source_id : two_hop_search(reject_all).neighbors) {
     EXPECT_GE(source_id, static_cast<uint32_t>(n_rows));
   }
 }
 
-// The predicate reads the tenant of the query, whose number the fixture's max_queries = 2 makes
-// the place in the batch plus an offset.
-TEST_P(CagraUdfFilterTwoHopTest, PredicateWithFilterData)
+// The predicate looks up the tenant of the query by query id. The fixture searches with
+// max_queries = 2, so this also verifies that the batch offset is added to the query id.
+TEST_P(CagraUdfFilterTwoHopTest, TenantContextHonorsQuerySpecificMetadata)
 {
   std::vector<uint32_t> host_row_tenants(n_rows);
   std::vector<uint32_t> host_query_tenants(n_queries);
@@ -558,7 +564,7 @@ TEST_P(CagraUdfFilterTwoHopTest, PredicateWithFilterData)
                      return host_row_tenants[static_cast<size_t>(row)] ==
                             host_query_tenants[static_cast<size_t>(q)];
                    }),
-            0.9);
+            min_recall);
 }
 
 INSTANTIATE_TEST_CASE_P(CagraUdfFilters,
@@ -567,7 +573,7 @@ INSTANTIATE_TEST_CASE_P(CagraUdfFilters,
                                           cagra::search_algo::MULTI_CTA,
                                           cagra::search_algo::MULTI_KERNEL));
 
-INSTANTIATE_TEST_CASE_P(CagraUdfFilters,
+INSTANTIATE_TEST_CASE_P(CagraUdfFilterTwoHop,
                         CagraUdfFilterTwoHopTest,
                         ::testing::Values(cagra::search_algo::MULTI_CTA));
 
