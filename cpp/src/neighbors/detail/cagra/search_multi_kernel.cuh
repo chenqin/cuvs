@@ -31,6 +31,7 @@
 #include <raft/util/cuda_rt_essentials.hpp>
 #include <raft/util/cudart_utils.hpp>  // RAFT_CUDA_TRY_NOT_THROW is used TODO(tfeher): consider moving this to cuda_rt_essentials.hpp
 
+#include <raft/core/resource/device_memory_resource.hpp>
 #include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
 
@@ -334,16 +335,26 @@ struct search
          int64_t graph_degree,
          uint32_t topk)
     : base_type(res, params, dataset_desc, dim, dataset_size, graph_degree, topk),
-      result_indices(0, raft::resource::get_cuda_stream(res)),
-      result_distances(0, raft::resource::get_cuda_stream(res)),
-      parent_node_list(0, raft::resource::get_cuda_stream(res)),
-      topk_hint(0, raft::resource::get_cuda_stream(res)),
-      topk_workspace(0, raft::resource::get_cuda_stream(res)),
-      terminate_flag(0, raft::resource::get_cuda_stream(res)),
-      input_keys_storage(0, raft::resource::get_cuda_stream(res)),
-      output_keys_storage(0, raft::resource::get_cuda_stream(res)),
-      input_values_storage(0, raft::resource::get_cuda_stream(res)),
-      output_values_storage(0, raft::resource::get_cuda_stream(res))
+      result_indices(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      result_distances(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      parent_node_list(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      topk_hint(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      topk_workspace(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      terminate_flag(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      input_keys_storage(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      output_keys_storage(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      input_values_storage(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res)),
+      output_values_storage(
+        0, raft::resource::get_cuda_stream(res), raft::resource::get_workspace_resource_ref(res))
   {
     set_params(res);
   }
