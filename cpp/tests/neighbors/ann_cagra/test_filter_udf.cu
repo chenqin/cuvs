@@ -182,7 +182,7 @@ class CagraUdfFilterTest : public ::testing::TestWithParam<cagra::search_algo> {
 };
 
 // MULTI_CTA searches with filter_expansion = PASSING_TWO_HOP. This mode calls the linked predicate
-// for every node it examines and selects its seeds by testing random nodes with the predicate.
+// for every node it examines and selects its seed nodes by testing random nodes with the predicate.
 class CagraUdfFilterTwoHopTest : public CagraUdfFilterTest {
  protected:
   // Minimum recall against each query's exact nearest passing rows (see recall()). The same floor
@@ -521,7 +521,7 @@ TEST_P(CagraUdfFilterTwoHopTest, HighFilteringRateFindsNearestValidNeighbors)
             min_recall);
 }
 
-// A predicate that passes no row leaves the search without seeds.
+// A predicate that passes no row leaves the search without seed nodes.
 TEST_P(CagraUdfFilterTwoHopTest, RejectAllReturnsNoValidNeighbors)
 {
   cuvs::neighbors::filtering::udf_filter reject_all(reject_all_udf_source(), nullptr, 0.999f);

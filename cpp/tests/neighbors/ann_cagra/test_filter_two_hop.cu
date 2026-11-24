@@ -474,7 +474,8 @@ TEST_F(CagraFilterTwoHopTest, NoPassingRowReturnsNoNeighbors)
 }
 
 // For a filter that is not a bitset with standard 32-bit packing, PASSING_TWO_HOP calls the
-// linked filter for every node it examines and selects its seeds by testing random nodes with it.
+// linked filter for every node it examines and selects its seed nodes by testing random nodes with
+// it.
 TEST_F(CagraFilterTwoHopTest, BloomFilterFindsFilteredNeighbors)
 {
   auto stream = raft::resource::get_cuda_stream(res);

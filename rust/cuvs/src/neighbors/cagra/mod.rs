@@ -144,11 +144,14 @@ impl From<ffi::cuvsCagraHashMode> for HashMode {
 /// nodes that pass the filter and are at most two hops apart in the graph, so
 /// [`FilterExpansion::PassingTwoHop`] is effective when the rows that pass the
 /// filter are close to each other in the graph. When fewer than roughly one
-/// row in `graph_degree * graph_degree` passes the filter, or the rows that
-/// pass are spread uniformly over the dataset at a low rate, the search cannot
-/// move beyond its initial random seed nodes. Use [`FilterExpansion::ScoreAll`]
-/// or an exact search ([`brute_force`](crate::neighbors::brute_force) with a
-/// bitset filter) for such filters.
+/// row in `graph_degree * graph_degree` passes the filter, the search cannot
+/// move beyond its initial random seed nodes. When the rows that pass are
+/// spread uniformly over the dataset at a rate not far above that, the search
+/// converges slowly and needs a much larger `itopk_size` than
+/// [`FilterExpansion::ScoreAll`] for the same recall. Use
+/// [`FilterExpansion::ScoreAll`] or an exact search
+/// ([`brute_force`](crate::neighbors::brute_force) with a bitset filter) for
+/// such filters.
 ///
 /// [`FilterExpansion::PassingTwoHop`] is implemented by
 /// [`SearchAlgo::MultiCta`] only. It selects [`SearchAlgo::MultiCta`] when
@@ -174,7 +177,7 @@ pub enum FilterExpansion {
     /// bridge), the neighbors of the bridge that pass the filter, up to the
     /// child capacity of the result buffer (about `graph_degree` nodes). The
     /// initial random seed nodes are random nodes that pass the filter, each
-    /// the nearest of `num_random_samplings` such nodes. `itopk_size` is not
+    /// the nearest of up to `num_random_samplings` such nodes. `itopk_size` is not
     /// increased according to `filtering_rate`, and the filtering rate of the
     /// filter is not computed.
     PassingTwoHop,

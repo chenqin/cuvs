@@ -96,10 +96,12 @@ public class CagraSearchParams {
    * pass the filter and are at most two hops apart in the graph, so
    * {@link #PASSING_TWO_HOP} is effective when the rows that pass the filter
    * are close to each other in the graph. When fewer than roughly one row in
-   * {@code graphDegree * graphDegree} passes the filter, or the rows that pass
-   * are spread uniformly over the dataset at a low rate, the search cannot move
-   * beyond its initial random seed nodes. Use {@link #SCORE_ALL} or an exact
-   * search ({@link BruteForceIndex} with a prefilter) for such filters.
+   * {@code graphDegree * graphDegree} passes the filter, the search cannot move
+   * beyond its initial random seed nodes. When the rows that pass are spread
+   * uniformly over the dataset at a rate not far above that, the search
+   * converges slowly and needs a much larger itopk size than {@link #SCORE_ALL}
+   * for the same recall. Use {@link #SCORE_ALL} or an exact search
+   * ({@link BruteForceIndex} with a prefilter) for such filters.
    *
    * <p>Only the MULTI_CTA search algorithm implements {@link #PASSING_TWO_HOP}.
    * {@link MultiPartitionCagraSearch} always uses {@link #SCORE_ALL}.
@@ -120,8 +122,8 @@ public class CagraSearchParams {
      * for each neighbor that is filtered out (a bridge), the neighbors of the
      * bridge that pass the filter, up to the child capacity of the result
      * buffer (about the graph degree). The initial random seed nodes are random
-     * nodes that pass the filter, each the nearest of as many such nodes as the
-     * number of random samplings (see
+     * nodes that pass the filter, each the nearest of up to as many such nodes
+     * as the number of random samplings (see
      * {@link Builder#withNumRandomSamplings(int)}). The itopk size is not
      * increased according to the filtering rate, and the filtering rate of the
      * prefilter is not computed.

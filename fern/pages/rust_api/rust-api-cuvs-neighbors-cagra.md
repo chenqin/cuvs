@@ -106,12 +106,32 @@ pub enum FilterExpansion {
 }
 ```
 
-How a filtered [`SearchAlgo::MultiCta`] search walks the graph.
+How a filtered CAGRA search traverses the graph.
 
-With [`FilterExpansion::PassingTwoHop`], [`SearchAlgo::Auto`] selects
-[`SearchAlgo::MultiCta`]. Other search algorithms ignore it.
+[`FilterExpansion::PassingTwoHop`] is intended for filters that pass a small
+fraction of the dataset, where [`FilterExpansion::ScoreAll`] computes most
+distances for nodes that are filtered out. The search only moves between
+nodes that pass the filter and are at most two hops apart in the graph, so
+[`FilterExpansion::PassingTwoHop`] is effective when the rows that pass the
+filter are close to each other in the graph. When fewer than roughly one
+row in `graph_degree * graph_degree` passes the filter, the search cannot
+move beyond its initial random seed nodes. When the rows that pass are
+spread uniformly over the dataset at a rate not far above that, the search
+converges slowly and needs a much larger `itopk_size` than
+[`FilterExpansion::ScoreAll`] for the same recall. Use
+[`FilterExpansion::ScoreAll`] or an exact search
+([`brute_force`](crate::neighbors::brute_force) with a bitset filter) for
+such filters.
 
-_Source: `rust/cuvs/src/neighbors/cagra/mod.rs:145`_
+[`FilterExpansion::PassingTwoHop`] is implemented by
+[`SearchAlgo::MultiCta`] only. It selects [`SearchAlgo::MultiCta`] when
+`algo` is [`SearchAlgo::Auto`], unless `persistent` is set. The other
+algorithms ignore it and log a warning. `algo` defaults to
+[`SearchAlgo::SingleCta`], so it must be set to [`SearchAlgo::MultiCta`]
+(or [`SearchAlgo::Auto`]) for [`FilterExpansion::PassingTwoHop`] to take
+effect. The value has no effect on a search without a filter.
+
+_Source: `rust/cuvs/src/neighbors/cagra/mod.rs:165`_
 
 ## CagraError
 
@@ -125,4 +145,4 @@ pub enum CagraError {
 
 Error type for CAGRA operations.
 
-_Source: `rust/cuvs/src/neighbors/cagra/mod.rs:179`_
+_Source: `rust/cuvs/src/neighbors/cagra/mod.rs:207`_

@@ -38,9 +38,10 @@ const (
 // search only moves between nodes that pass the filter and are at most two hops apart in the
 // graph, so FilterExpansionPassingTwoHop is effective when the rows that pass the filter are close
 // to each other in the graph. When fewer than roughly one row in graph_degree * graph_degree
-// passes the filter, or the rows that pass are spread uniformly over the dataset at a low rate,
-// the search cannot move beyond its initial random seed nodes. Use FilterExpansionScoreAll or an
-// exact search for such filters.
+// passes the filter, the search cannot move beyond its initial random seed nodes. When the rows
+// that pass are spread uniformly over the dataset at a rate not far above that, the search
+// converges slowly and needs a much larger itopk_size than FilterExpansionScoreAll for the same
+// recall. Use FilterExpansionScoreAll or an exact search for such filters.
 //
 // Only the MULTI_CTA search algorithm implements FilterExpansionPassingTwoHop.
 type FilterExpansion int
@@ -57,7 +58,7 @@ const (
 	// neighbors that pass the filter and, for each neighbor that is filtered out (a bridge), the
 	// neighbors of the bridge that pass the filter, up to the child capacity of the result buffer
 	// (about graph_degree nodes). The initial random seed nodes are random nodes that pass the
-	// filter, each the nearest of num_random_samplings such nodes. itopk_size is not increased
+	// filter, each the nearest of up to num_random_samplings such nodes. itopk_size is not increased
 	// according to filtering_rate, and the filtering rate of the filter is not computed.
 	FilterExpansionPassingTwoHop
 )

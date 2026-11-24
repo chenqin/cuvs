@@ -714,9 +714,9 @@ cdef class SearchParams:
               the bridge that pass the filter, up to the child capacity of
               the result buffer (about graph_degree nodes). The initial
               random seed nodes are random nodes that pass the filter, each
-              the nearest of num_random_samplings such nodes. itopk_size is
-              not increased according to filtering_rate, and the filtering
-              rate of a bitset filter is not computed.
+              the nearest of up to num_random_samplings such nodes.
+              itopk_size is not increased according to filtering_rate, and
+              the filtering rate of a bitset filter is not computed.
 
         passing_two_hop is intended for filters that pass a small fraction
         of the dataset, where score_all computes most distances for nodes
@@ -724,11 +724,13 @@ cdef class SearchParams:
         pass the filter and are at most two hops apart in the graph, so
         passing_two_hop is effective when the rows that pass the filter are
         close to each other in the graph. When fewer than roughly one row
-        in `graph_degree * graph_degree` passes the filter, or the rows
-        that pass are spread uniformly over the dataset at a low rate, the
-        search cannot move beyond its initial random seed nodes. Use
-        score_all or an exact search (cuvs.neighbors.brute_force.search
-        with a bitset prefilter) for such filters.
+        in `graph_degree * graph_degree` passes the filter, the search
+        cannot move beyond its initial random seed nodes. When the rows
+        that pass are spread uniformly over the dataset at a rate not far
+        above that, the search converges slowly and needs a much larger
+        itopk_size than score_all for the same recall. Use score_all or an
+        exact search (cuvs.neighbors.brute_force.search with a bitset
+        prefilter) for such filters.
 
         passing_two_hop is implemented by the multi_cta algorithm only. It
         selects multi_cta when algo is "auto", unless persistent is set.

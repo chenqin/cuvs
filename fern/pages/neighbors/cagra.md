@@ -968,13 +968,13 @@ Only `MULTI_CTA` implements `PASSING_TWO_HOP`:
 
 With `PASSING_TWO_HOP`:
 
-- The initial random seed nodes are vectors that pass the filter. Each seed is the nearest of `num_random_samplings` random vectors that pass the filter, so a larger value gives seeds that are closer to the query.
+- The initial random seed nodes are vectors that pass the filter. Each seed node is the nearest of up to `num_random_samplings` random vectors that pass the filter, so a larger value gives seed nodes that are closer to the query.
 - `itopk_size` is not increased by the filtering rate, and the filtering rate of a bitset filter is not computed.
 - The search is tuned with the same parameters as an unfiltered `MULTI_CTA` search (`itopk_size`, `search_width`, `max_iterations`) and with `num_random_samplings`.
 
 `PASSING_TWO_HOP` is an opt-in mode for filters whose passing vectors are close to each other in the graph, such as a filter on an attribute that similar vectors share. A parent node then has vectors that pass the filter among its neighbors and the neighbors of its bridges, and the search moves toward the query through them.
 
-Do not use `PASSING_TWO_HOP` when the vectors that pass the filter are spread uniformly over the index at a low rate. The search reaches a vector only if it passes the filter and is within two hops of a parent node, and no distance is computed to a bridge, so the search cannot tell which bridge leads toward the query. When fewer than roughly one vector in `graph_degree * graph_degree` passes the filter, or the passing vectors are spread so that few of them are within two hops of each other, a parent node has few or no child nodes, the search cannot move beyond its seeds, and recall is low. For the same reason, an isolated vector that passes the filter among filtered-out vectors, such as a false positive of a bloom filter, may not be found. For such filters, use `SCORE_ALL`, which traverses the graph regardless of the filter, or an exact search such as `brute_force::search` with a bitset filter (see [Brute-force](/user-guide/api-guides/indexing-guide/brute-force#using-filters)).
+Do not use `PASSING_TWO_HOP` when the vectors that pass the filter are spread uniformly over the index at a low rate. The search reaches a vector only if it passes the filter and is within two hops of a parent node, and no distance is computed to a bridge, so the search cannot tell which bridge leads toward the query. When fewer than roughly one vector in `graph_degree * graph_degree` passes the filter, or the passing vectors are spread so that few of them are within two hops of each other, a parent node has few or no child nodes, the search cannot move beyond its seed nodes, and recall is low. For the same reason, an isolated vector that passes the filter among filtered-out vectors, such as a false positive of a bloom filter, may not be found. For such filters, use `SCORE_ALL`, which traverses the graph regardless of the filter, or an exact search such as `brute_force::search` with a bitset filter (see [Brute-force](/user-guide/api-guides/indexing-guide/brute-force#using-filters)).
 
 <Tabs>
 <Tab title="C">
@@ -1196,12 +1196,12 @@ cagra::search(res, search_params, index, queries, neighbors, distances,
 
 ### Building indexes for filtered search
 
-For searches whose filters pass a small share of the rows, build an FP16 index with a graph and search it with `filter_expansion = PASSING_TWO_HOP`: the walk tests a filtered-out row's own neighbours instead of stopping at it, so it stays connected when most rows fail, and its cost does not depend on how many rows the filter passes. Recall is set by `itopk_size`, `search_width`, `max_iterations` and `num_random_samplings`.
+For searches whose filters pass a small part of the rows, and whose passing rows are close to each other in the graph, build an FP16 index with a graph and search it with `filter_expansion = PASSING_TWO_HOP`. See [Filter expansion](#filter-expansion) for the filters this mode suits and the ones it does not. Recall is tuned with `itopk_size`, `search_width`, `max_iterations` and `num_random_samplings`.
 
 Building:
 
-- Build from FP16 rows: it halves the memory traffic of the walk against FP32.
-- `graph_degree = 32` and `intermediate_graph_degree = 64` are a good start for the two-hop walk: they leave about 1,000 rows within two hops of each row, so a filter passing one row in 1,000 still has passing rows to walk to. A filter narrower than about one row in `graph_degree * graph_degree` leaves the walk stuck at its starting rows.
+- Build from FP16 rows: the distance computations read half the memory that FP32 rows need.
+- `graph_degree = 32` and `intermediate_graph_degree = 64` are a good start for `PASSING_TWO_HOP`: about 1,000 rows are then within two hops of each row. A filter that passes fewer than about one row in `graph_degree * graph_degree` leaves the search at its initial random seed nodes.
 - Memory per row on the device: the FP16 rows take 2 bytes a padded dimension; the graph takes 4 bytes a neighbor (128 bytes at degree 32).
 - Search with queries whose row stride equals the dimension (a pitch view of padded rows works). With any other stride the search runs one launch per query.
 
@@ -1323,8 +1323,8 @@ The product of that value and `leaf_degree` must not exceed `255`. Fanouts must 
 | `persistent_lifetime` | `2.0` | Seconds before a persistent kernel stops when no requests are received. |
 | `persistent_device_usage` | `1.0` | Fraction of the maximum grid size used by the persistent kernel. Lower values can leave GPU capacity for other work. |
 | `filtering_rate` | `-1.0` | Expected fraction of nodes filtered out during filtered search. Negative values let NVIDIA cuVS estimate it automatically. In the C API and the language bindings built on it, the default is `0`, which also means automatic. |
-| `filter_expansion` | `SCORE_ALL` | How a filtered `MULTI_CTA` search walks the graph. `SCORE_ALL` scores every neighbor and drops filtered-out vectors from the result; `PASSING_TWO_HOP` scores and expands only vectors that pass the filter. See [Filter expansion](#filter-expansion). |
-| `query_bitsets` | null | Device array with one bitset pointer per query, for `MULTI_CTA` searches whose queries have different bitset filters. See [One bitset per query](#one-bitset-per-query). |
+| `filter_expansion` | `SCORE_ALL` | How a filtered search traverses the graph. `SCORE_ALL` computes the distance to every neighbor and removes filtered-out vectors from the result; `PASSING_TWO_HOP` (`MULTI_CTA` only) computes distances only to vectors that pass the filter, and only those become parent nodes. See [Filter expansion](#filter-expansion). |
+| `query_bitsets` | `nullptr` | Device array with one bitset pointer per query, for `MULTI_CTA` searches whose queries have different bitset filters. See [One bitset per query](#one-bitset-per-query). |
 
 ## Tuning
 

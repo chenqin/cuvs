@@ -65,18 +65,19 @@ enum class internal_dtype { F16 = 0, E5M2 = 1 };
  * node are its neighbors that pass the filter and, for each neighbor that is filtered out (a
  * bridge), the neighbors of the bridge that pass the filter, up to the child capacity of the
  * result buffer (about `graph_degree` nodes). The initial random seed nodes are random nodes that
- * pass the filter, each the nearest of `num_random_samplings` such nodes. `itopk_size` is not
- * increased according to `filtering_rate`, and the filtering rate of a `filtering::bitset_filter`
- * is not computed.
+ * pass the filter, each the nearest of up to `num_random_samplings` such nodes. `itopk_size` is
+ * not increased according to `filtering_rate`, and the filtering rate of a
+ * `filtering::bitset_filter` is not computed.
  *
  * `PASSING_TWO_HOP` is intended for filters that pass a small fraction of the dataset, where
  * `SCORE_ALL` computes most distances for nodes that are filtered out. The search only moves
  * between nodes that pass the filter and are at most two hops apart in the graph, so
  * `PASSING_TWO_HOP` is effective when the rows that pass the filter are close to each other in the
- * graph. When fewer than roughly one row in `graph_degree * graph_degree` passes the filter, or
- * the rows that pass are spread uniformly over the dataset at a low rate, the search cannot move
- * beyond its initial random seed nodes. Use `SCORE_ALL` or an exact search (`brute_force::search`
- * with a bitset filter) for such filters.
+ * graph. When fewer than roughly one row in `graph_degree * graph_degree` passes the filter, the
+ * search cannot move beyond its initial random seed nodes. When the rows that pass are spread
+ * uniformly over the dataset at a rate not far above that, the search converges slowly and needs a
+ * much larger `itopk_size` than `SCORE_ALL` for the same recall. Use `SCORE_ALL` or an exact search
+ * (`brute_force::search` with a bitset filter) for such filters.
  *
  * Only the MULTI_CTA search algorithm implements `PASSING_TWO_HOP`. Multi-partition search always
  * uses `SCORE_ALL`.
