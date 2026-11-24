@@ -19,6 +19,10 @@ inline constexpr std::uint32_t kCagraFilterPassingTwoHop = 1u << 0;
 /// directly instead of calling the linked `sample_filter`. Set only together with
 /// `kCagraFilterPassingTwoHop`.
 inline constexpr std::uint32_t kCagraFilterBitsetWords = 1u << 1;
+/// `filter_data` is `search_params::query_bitsets`: an array of `const std::uint32_t*` indexed by
+/// `query_id + query_id_offset`. Each pointer is the bitset of one query (standard 32-bit
+/// packing), or null if the query is not filtered. The linked `sample_filter` is not called.
+inline constexpr std::uint32_t kCagraFilterQueryBitsets = 1u << 2;
 
 /// Device payload for linked CAGRA sample filters plus query offset for wrapped filters.
 template <typename SourceIndexT>

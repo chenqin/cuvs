@@ -437,6 +437,11 @@ struct search_plan_impl : public search_plan_impl_base {
       error_message += "An invalid filter expansion mode has been given: " +
                        std::to_string(static_cast<int>(filter_expansion)) + "";
     }
+    if (query_bitsets != nullptr && algo != search_algo::MULTI_CTA) {
+      // Only the MULTI_CTA kernel reads query_bitsets. The other kernels would apply the bitset
+      // of the filter object to every query instead.
+      error_message += "`query_bitsets` is only supported with the MULTI_CTA search algorithm.";
+    }
     if (hashmap_min_bitlen > 20) {
       error_message += "`hashmap_min_bitlen` must be equal to or smaller than 20. " +
                        std::to_string(hashmap_min_bitlen) + " has been given.";
