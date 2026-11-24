@@ -108,6 +108,17 @@ using search_single_cta_p_kernel_func_t =
 
 namespace multi_cta_search {
 
+/// Maximum thread block size of the `search_multi_cta_small` entry point: the thread limit in its
+/// `__launch_bounds__`, and the largest thread block size for which the launcher selects it.
+inline constexpr std::uint32_t kSmallBlockMaxThreads = 256;
+
+/// Minimum number of resident thread blocks per multiprocessor in the `__launch_bounds__` of
+/// `search_multi_cta_small`. The compiler limits the registers per thread so that this many thread
+/// blocks of `kSmallBlockMaxThreads` threads fit on a multiprocessor. It ignores the request on
+/// GPUs whose multiprocessors hold fewer threads than that (compute capability 7.5), where the
+/// launcher does not select `search_multi_cta_small`.
+inline constexpr std::uint32_t kSmallBlockMinBlocksPerSm = 6;
+
 template <typename DataT, typename IndexT, typename DistanceT, typename SourceIndexT>
 using search_multi_cta_mp_kernel_func_t =
   void(const multi_partition_desc_t<DataT, IndexT, DistanceT>*,
