@@ -687,6 +687,86 @@ cdef class SearchParams:
         requests are received.
     persistent_device_usage : float
         Sets the fraction of maximum grid size used by persistent kernel.
+    filtering_rate: float, optional
+        A parameter indicating the rate of nodes to be filtered-out, when
+        filtering is used. The value must be greater than 0.0 and less than
+        1.0. When not given, the filtering rate is automatically calculated
+        when possible. For a bitset filter, each search call then counts
+        the bits of the bitset and waits for the result, unless
+        filter_expansion is "passing_two_hop", which does not use the rate.
+    filter_expansion: str, default = "score_all"
+        String denoting how a filtered search traverses the graph.
+        Valid values for filter_expansion: ["score_all",
+        "passing_two_hop"], where:
+
+            - score_all computes the distance for every neighbor of a
+              parent node, whether or not it passes the filter, and a
+              filtered-out node can be selected as a parent node.
+              Filtered-out nodes are removed from the search results. The
+              multi_cta algorithm increases itopk_size according to
+              filtering_rate to compensate for the filtered-out nodes in
+              the itopk list.
+            - passing_two_hop computes the distance only for nodes that
+              pass the filter, and only these nodes enter the itopk list
+              and are selected as parent nodes. The child nodes of a parent
+              node are its neighbors that pass the filter and, for each
+              neighbor that is filtered out (a bridge), the neighbors of
+              the bridge that pass the filter, up to the child capacity of
+              the result buffer (about graph_degree nodes). The initial
+              random seed nodes are random nodes that pass the filter, each
+              the nearest of up to num_random_samplings such nodes.
+              itopk_size is not increased according to filtering_rate, and
+              the filtering rate of a bitset filter is not computed.
+
+        passing_two_hop is intended for filters that pass a small fraction
+        of the dataset, where score_all computes most distances for nodes
+        that are filtered out. The search only moves between nodes that
+        pass the filter and are at most two hops apart in the graph, so
+        passing_two_hop is effective when the rows that pass the filter are
+        close to each other in the graph. When fewer than roughly one row
+        in `graph_degree * graph_degree` passes the filter, the search
+        cannot move beyond its initial random seed nodes. When the rows
+        that pass are spread uniformly over the dataset at a rate not far
+        above that, the search converges slowly and needs a much larger
+        itopk_size than score_all for the same recall. Use score_all or an
+        exact search (cuvs.neighbors.brute_force.search with a bitset
+        prefilter) for such filters.
+
+        passing_two_hop is implemented by the multi_cta algorithm only. It
+        selects multi_cta when algo is "auto", unless persistent is set.
+        The other algorithms ignore it and log a warning. The value has no
+        effect on a search without a filter.
+
+    query_bitsets: int or CUDA array interface compliant array, optional
+        Per-query filter bitsets for multi_cta search. Either the device
+        address of an array with one pointer per query of the search call,
+        or a one-dimensional device array of dtype uint64 that holds those
+        pointers, for example a cupy array. Each pointer is the device
+        address of the uint32 words of the bitset for that query, with one
+        bit per row of the index: row `i` passes the filter when bit
+        `i % 32` of word `i // 32` is set. A null pointer leaves that query
+        unfiltered. The bitset of the filter passed to the search is not
+        read, so queries with different filters can share one search call.
+
+        Requirements:
+
+            - The filter passed to the search must be a bitset filter (see
+              cuvs.neighbors.filters.from_bitset).
+            - algo must be "multi_cta" or "auto". "auto" selects multi_cta
+              unless persistent is set. The search fails with any other
+              algorithm.
+            - With "score_all", filtering_rate must be given, because it is
+              not calculated from per-query bitsets. "passing_two_hop" does
+              not use it.
+            - Tiered index search does not support per-query bitsets and
+              fails when they are given.
+
+        The pointer array and the bitsets must reside on the device that
+        the search runs on and must remain valid until the search has
+        completed: until `search` returns or, when a `resources` object is
+        passed to it, until `resources.sync()` has been called. An array
+        given here is kept alive by this object. The bitsets it points to,
+        and an array given by its address, are not.
 
     """
 
@@ -713,7 +793,10 @@ cdef class SearchParams:
                  rand_xor_mask=0x128394,
                  persistent=False,
                  persistent_lifetime=None,
-                 persistent_device_usage=None
+                 persistent_device_usage=None,
+                 filtering_rate=None,
+                 filter_expansion="score_all",
+                 query_bitsets=None
                  ):
         self.params.max_queries = max_queries
         self.params.itopk_size = itopk_size
@@ -751,6 +834,28 @@ cdef class SearchParams:
             self.params.persistent_lifetime = persistent_lifetime
         if persistent_device_usage is not None:
             self.params.persistent_device_usage = persistent_device_usage
+        if filtering_rate is not None:
+            self.params.filtering_rate = filtering_rate
+        if filter_expansion == "score_all":
+            self.params.filter_expansion = \
+                cuvsCagraFilterExpansion.CUVS_CAGRA_FILTER_SCORE_ALL
+        elif filter_expansion == "passing_two_hop":
+            self.params.filter_expansion = \
+                cuvsCagraFilterExpansion.CUVS_CAGRA_FILTER_PASSING_TWO_HOP
+        else:
+            raise ValueError("`filter_expansion` value not supported.")
+
+        if query_bitsets is not None:
+            if hasattr(query_bitsets, "__cuda_array_interface__"):
+                query_bitsets_cai = cai_wrapper(query_bitsets)
+                _check_input_array(query_bitsets_cai, [np.dtype('uint64')])
+                if len(query_bitsets_cai.shape) != 1:
+                    raise ValueError("`query_bitsets` must be one-dimensional")
+                # keep the pointer array alive as long as these parameters
+                self._query_bitsets_owner = query_bitsets
+                self.params.query_bitsets = <uintptr_t>query_bitsets_cai.data
+            else:
+                self.params.query_bitsets = <uintptr_t>query_bitsets
 
     def __repr__(self):
         attr_str = [attr + "=" + str(getattr(self, attr))
@@ -759,7 +864,9 @@ cdef class SearchParams:
                         "team_size", "search_width", "min_iterations",
                         "thread_block_size", "hashmap_mode",
                         "hashmap_min_bitlen", "hashmap_max_fill_rate",
-                        "num_random_samplings", "rand_xor_mask"]]
+                        "num_random_samplings", "rand_xor_mask",
+                        "filtering_rate", "filter_expansion",
+                        "query_bitsets"]]
         return "SearchParams(type=CAGRA, " + (", ".join(attr_str)) + ")"
 
     def get_handle(self):
@@ -816,6 +923,23 @@ cdef class SearchParams:
     @property
     def rand_xor_mask(self):
         return self.params.rand_xor_mask
+
+    @property
+    def filtering_rate(self):
+        return self.params.filtering_rate
+
+    @property
+    def filter_expansion(self):
+        if self.params.filter_expansion == \
+                cuvsCagraFilterExpansion.CUVS_CAGRA_FILTER_SCORE_ALL:
+            return "score_all"
+        elif self.params.filter_expansion == \
+                cuvsCagraFilterExpansion.CUVS_CAGRA_FILTER_PASSING_TWO_HOP:
+            return "passing_two_hop"
+
+    @property
+    def query_bitsets(self):
+        return self.params.query_bitsets
 
 
 @auto_sync_resources

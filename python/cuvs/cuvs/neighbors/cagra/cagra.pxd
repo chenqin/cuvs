@@ -232,3 +232,4 @@ cdef class IndexParams:
 
 cdef class SearchParams:
     cdef cuvsCagraSearchParams * params
+    cdef object _query_bitsets_owner
