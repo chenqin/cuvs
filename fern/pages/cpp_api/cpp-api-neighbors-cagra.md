@@ -45,7 +45,8 @@ Only the MULTI_CTA search algorithm implements `PASSING_TWO_HOP`. Multi-partitio
 ```cpp
 enum class filter_expansion_mode {
   SCORE_ALL = 0,
-  PASSING_TWO_HOP = 1
+  PASSING_TWO_HOP = 1,
+  AUTO = 100
 };
 ```
 
@@ -55,6 +56,7 @@ enum class filter_expansion_mode {
 | --- | --- | --- |
 | `SCORE_ALL` | `0` | The distance is computed for every neighbor of a parent node, whether or not it passes the filter, and a filtered-out node can be selected as a parent node. Filtered-out nodes are removed from the search results. The MULTI_CTA algorithm increases `itopk_size` according to `filtering_rate` to compensate for the filtered-out nodes in the itopk list. |
 | `PASSING_TWO_HOP` | `1` | The distance is computed only for nodes that pass the filter, and only these nodes enter the itopk list and are selected as parent nodes. The child nodes of a parent node are its neighbors that pass the filter and, for each neighbor that is filtered out (a bridge), the neighbors of the bridge that pass the filter, up to the child capacity of the result buffer (about `graph_degree` nodes). The initial random seed nodes are random nodes that pass the filter, each the nearest of up to `num_random_samplings` such nodes. `itopk_size` is not increased according to `filtering_rate`, and the filtering rate of a |
+| `AUTO` | `100` | For a `filtering::bitset_filter`, the search samples rows that pass the filter and counts their graph neighbors that pass it too. It uses `PASSING_TWO_HOP` when such a row has at least 8 passing neighbors on average, which means that the rows that pass are close to each other in the graph, and `SCORE_ALL` otherwise, which includes filters whose passing rows are spread uniformly over the dataset. The estimate costs one small kernel and one synchronization of the stream per search call, as counting the bits of the bitset for `filtering_rate` does. Other filter types, and bitsets without standard 32-bit packing, use `SCORE_ALL`. `AUTO` cannot be combined with `search_params::query_bitsets`. |
 
 ## CAGRA index build parameters
 
