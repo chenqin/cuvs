@@ -100,16 +100,31 @@ const std::vector<RefineInputs<int64_t>> inputs =
     {cuvs::distance::DistanceType::L2Expanded, cuvs::distance::DistanceType::InnerProduct},
     {false, true});
 
+// k larger than the IVF-Flat scan's per-block top-k capacity (256): the device refine computes
+// the distance of every candidate and selects the best k.
+const std::vector<RefineInputs<int64_t>> inputs_large_k =
+  raft::util::itertools::product<RefineInputs<int64_t>>(
+    {static_cast<int64_t>(20)},
+    {static_cast<int64_t>(2000)},
+    {static_cast<int64_t>(16)},
+    {static_cast<int64_t>(300), static_cast<int64_t>(1000)},
+    {static_cast<int64_t>(1000)},
+    {cuvs::distance::DistanceType::L2Expanded, cuvs::distance::DistanceType::InnerProduct},
+    {false, true});
+
 typedef RefineTest<float, float, std::int64_t> RefineTestF;
 TEST_P(RefineTestF, AnnRefine) { this->testRefine(); }
 
 INSTANTIATE_TEST_CASE_P(RefineTest, RefineTestF, ::testing::ValuesIn(inputs));
+INSTANTIATE_TEST_CASE_P(RefineLargeK, RefineTestF, ::testing::ValuesIn(inputs_large_k));
 
 typedef RefineTest<uint8_t, float, std::int64_t> RefineTestF_uint8;
 TEST_P(RefineTestF_uint8, AnnRefine) { this->testRefine(); }
 INSTANTIATE_TEST_CASE_P(RefineTest, RefineTestF_uint8, ::testing::ValuesIn(inputs));
+INSTANTIATE_TEST_CASE_P(RefineLargeK, RefineTestF_uint8, ::testing::ValuesIn(inputs_large_k));
 
 typedef RefineTest<int8_t, float, std::int64_t> RefineTestF_int8;
 TEST_P(RefineTestF_int8, AnnRefine) { this->testRefine(); }
 INSTANTIATE_TEST_CASE_P(RefineTest, RefineTestF_int8, ::testing::ValuesIn(inputs));
+INSTANTIATE_TEST_CASE_P(RefineLargeK, RefineTestF_int8, ::testing::ValuesIn(inputs_large_k));
 }  // namespace cuvs::neighbors
