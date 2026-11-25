@@ -20,11 +20,13 @@ using cagra_sample_filter_t = cuvs::neighbors::cagra::detail::cagra_sample_filte
 
 namespace cuvs::neighbors::cagra::detail::multi_cta_search {
 
-// No __launch_bounds__ here: it would make nvJitLink ignore -maxrregcount. The multi-CTA planner
-// links search_multi_cta with -maxrregcount=64 (what __launch_bounds__(1024, 1) allowed, so any
-// block size up to 1024 launches) unless CUVS_CAGRA_JIT_LINK_OPTIONS_search_multi_cta sets a lower
-// cap. A lower cap raises the resident blocks per SM (64 registers x 128 threads limit an SM to 8
-// blocks).
+// Neither entry point has __launch_bounds__: it would make nvJitLink ignore -maxrregcount. The
+// multi-CTA planner links search_multi_cta with -maxrregcount=64 (what __launch_bounds__(1024, 1)
+// allowed, so any block size up to 1024 launches) and search_multi_cta_small with the cap that
+// __launch_bounds__(kSmallBlockMaxThreads, kSmallBlockMinBlocksPerSm) allowed (40 registers),
+// unless CUVS_CAGRA_JIT_LINK_OPTIONS_search_multi_cta (both entry points) or
+// CUVS_CAGRA_JIT_LINK_OPTIONS_search_multi_cta_small sets another cap. A lower cap raises the
+// resident blocks per SM (64 registers x 128 threads limit an SM to 8 blocks).
 extern "C" __global__ void search_multi_cta(index_t* const result_indices_ptr,
                                             distance_t* const result_distances_ptr,
                                             const dataset_desc_base* dataset_desc,
@@ -73,35 +75,33 @@ extern "C" __global__ void search_multi_cta(index_t* const result_indices_ptr,
 }
 
 // Variant of search_multi_cta for thread blocks of at most kSmallBlockMaxThreads threads. Its
-// launch bounds request that at least kSmallBlockMinBlocksPerSm thread blocks of that size fit on
-// a multiprocessor; those of search_multi_cta request one thread block of 1024 threads.
-// select_and_run() launches this variant when the thread block size is at most
+// default register cap (set at link time, see above) lets kSmallBlockMinBlocksPerSm thread blocks
+// of that size fit on a multiprocessor; that of search_multi_cta allows one thread block of 1024
+// threads. select_and_run() launches this variant when the thread block size is at most
 // kSmallBlockMaxThreads and the multiprocessors hold that many thread blocks (see
 // use_small_block_entry_point).
-extern "C" __global__
-__launch_bounds__(kSmallBlockMaxThreads, kSmallBlockMinBlocksPerSm) void search_multi_cta_small(
-  index_t* const result_indices_ptr,
-  distance_t* const result_distances_ptr,
-  const dataset_desc_base* dataset_desc,
-  const data_t* const queries_ptr,
-  const index_t* const knn_graph,
-  const std::uint32_t max_elements,
-  const std::uint32_t graph_degree,
-  const source_index_t* source_indices_ptr,
-  const unsigned num_distilation,
-  const uint64_t rand_xor_mask,
-  const index_t* seed_ptr,
-  const std::uint32_t num_seeds,
-  const std::uint32_t visited_hash_bitlen,
-  index_t* const traversed_hashmap_ptr,
-  const std::uint32_t traversed_hash_bitlen,
-  const std::uint32_t itopk_size,
-  const std::uint32_t min_iteration,
-  const std::uint32_t max_iteration,
-  std::uint32_t* const num_executed_iterations,
-  const index_t graph_size,
-  const std::uint32_t query_id_offset,
-  cagra_sample_filter_t filter_payload)
+extern "C" __global__ void search_multi_cta_small(index_t* const result_indices_ptr,
+                                                  distance_t* const result_distances_ptr,
+                                                  const dataset_desc_base* dataset_desc,
+                                                  const data_t* const queries_ptr,
+                                                  const index_t* const knn_graph,
+                                                  const std::uint32_t max_elements,
+                                                  const std::uint32_t graph_degree,
+                                                  const source_index_t* source_indices_ptr,
+                                                  const unsigned num_distilation,
+                                                  const uint64_t rand_xor_mask,
+                                                  const index_t* seed_ptr,
+                                                  const std::uint32_t num_seeds,
+                                                  const std::uint32_t visited_hash_bitlen,
+                                                  index_t* const traversed_hashmap_ptr,
+                                                  const std::uint32_t traversed_hash_bitlen,
+                                                  const std::uint32_t itopk_size,
+                                                  const std::uint32_t min_iteration,
+                                                  const std::uint32_t max_iteration,
+                                                  std::uint32_t* const num_executed_iterations,
+                                                  const index_t graph_size,
+                                                  const std::uint32_t query_id_offset,
+                                                  cagra_sample_filter_t filter_payload)
 {
   search_kernel_jit<data_t, index_t, distance_t, source_index_t>(result_indices_ptr,
                                                                  result_distances_ptr,

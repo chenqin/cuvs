@@ -84,10 +84,9 @@ void set_multi_cta_filter_flags(cagra_sample_filter<SourceIndexT>& payload,
 
 // Whether select_and_run() launches the search_multi_cta_small entry point. It does for thread
 // blocks of at most kSmallBlockMaxThreads threads, if the multiprocessors of the current device
-// hold kSmallBlockMinBlocksPerSm such thread blocks. On GPUs whose multiprocessors hold fewer
-// threads (compute capability 7.5), the compiler ignores the minimum number of thread blocks in the
-// launch bounds of search_multi_cta_small, and the entry point then uses more registers per thread
-// than search_multi_cta, which lowers the number of resident thread blocks.
+// hold kSmallBlockMinBlocksPerSm such thread blocks. Its default register cap is chosen for that
+// many resident thread blocks; on GPUs whose multiprocessors hold fewer threads (compute capability
+// 7.5) at most 4 fit whatever the registers, so the cap would only cost spills.
 inline bool use_small_block_entry_point(uint32_t block_size)
 {
   if (block_size > kSmallBlockMaxThreads) { return false; }

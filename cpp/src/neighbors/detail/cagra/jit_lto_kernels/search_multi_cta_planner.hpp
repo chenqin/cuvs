@@ -6,8 +6,13 @@
 #pragma once
 
 #include "cagra_planner_base.hpp"
+#include "kernel_def.hpp"
 #include <cuvs/detail/jit_lto/cagra/cagra_fragments.hpp>
 #include <cuvs/distance/distance.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
 
 namespace cuvs::neighbors::cagra::detail::multi_cta_search {
 
@@ -23,7 +28,7 @@ struct CagraMultiCtaSearchPlanner
   static inline rtcx::launcher_jit_cache launcher_jit_cache{};
   static inline rtcx::launcher_jit_cache launcher_jit_cache_small{};
 
-  /// `small` selects the `search_multi_cta_small` entry point, which is compiled for thread blocks
+  /// `small` selects the `search_multi_cta_small` entry point, which is used only for thread blocks
   /// of at most `kSmallBlockMaxThreads` threads. Each entry point has its own launcher cache: both
   /// are linked from the same fragments, and a cache reuses the linked kernel for a fragment key.
   CagraMultiCtaSearchPlanner(cuvs::distance::DistanceType /*metric*/,
@@ -37,14 +42,36 @@ struct CagraMultiCtaSearchPlanner
         small ? "search_multi_cta_small" : "search_multi_cta",
         small ? launcher_jit_cache_small : launcher_jit_cache)
   {
-    // The kernel has no __launch_bounds__ (see search_multi_cta_kernel.cu.in): cap its registers at
-    // 64, what 1,024 threads a block allow, unless the environment set a cap.
-    bool capped = false;
-    for (const auto& option : this->linktime_extra_options) {
-      if (option.rfind("-maxrregcount", 0) == 0) { capped = true; }
+    auto& options = this->linktime_extra_options;
+    if (small) {
+      // search_multi_cta_small is search_multi_cta for smaller blocks: the options given for
+      // search_multi_cta apply to it as well, before the general ones and its own.
+      auto inherited = this->link_options_from_env("CUVS_CAGRA_JIT_LINK_OPTIONS_search_multi_cta");
+      options.insert(options.begin(), inherited.begin(), inherited.end());
     }
-    if (!capped) { this->linktime_extra_options.push_back("-maxrregcount=64"); }
+    // Neither entry point has __launch_bounds__ (see search_multi_cta_kernel.cu.in), so the link
+    // sets the register cap. The last -maxrregcount given wins. Without one, the cap is what launch
+    // bounds would allow: 64 registers for blocks of up to 1,024 threads, and kSmallMaxRegisters
+    // for the small entry point.
+    auto is_cap = [](const std::string& option) { return option.rfind("-maxrregcount", 0) == 0; };
+    auto last   = std::find_if(options.rbegin(), options.rend(), is_cap);
+    if (last == options.rend()) {
+      options.push_back(small ? "-maxrregcount=" + std::to_string(kSmallMaxRegisters)
+                              : std::string("-maxrregcount=64"));
+    } else {
+      std::string cap = *last;
+      options.erase(std::remove_if(options.begin(), options.end(), is_cap), options.end());
+      options.push_back(cap);
+    }
   }
+
+  /// The register cap of search_multi_cta_small without a -maxrregcount option: the most registers
+  /// a thread can have when kSmallBlockMinBlocksPerSm blocks of kSmallBlockMaxThreads threads share
+  /// a multiprocessor's 65,536 registers, rounded down to the 8-register allocation unit
+  /// (65,536 / (6 x 256) = 42, so 40).
+  static constexpr uint32_t kSmallMaxRegisters =
+    (65536u / (kSmallBlockMinBlocksPerSm * kSmallBlockMaxThreads)) / 8u * 8u;
+  static_assert(kSmallMaxRegisters == 40);
 
   void add_search_multi_cta_kernel_fragment()
   {

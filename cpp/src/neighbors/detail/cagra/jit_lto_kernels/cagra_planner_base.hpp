@@ -19,6 +19,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace cuvs::neighbors::cagra::detail {
 
@@ -47,13 +48,23 @@ struct CagraPlannerBase : rtcx::algorithm_planner {
     for (const std::string& name :
          {std::string("CUVS_CAGRA_JIT_LINK_OPTIONS"),
           std::string("CUVS_CAGRA_JIT_LINK_OPTIONS_") + this->entrypoint}) {
-      const char* options = std::getenv(name.c_str());
-      if (options == nullptr) { continue; }
-      std::istringstream words(options);
-      for (std::string option; words >> option;) {
-        this->linktime_extra_options.push_back(option);
+      for (std::string& option : link_options_from_env(name)) {
+        this->linktime_extra_options.push_back(std::move(option));
       }
     }
+  }
+
+  /// The space-separated words of the environment variable `name` (none if it is unset).
+  static std::vector<std::string> link_options_from_env(const std::string& name)
+  {
+    std::vector<std::string> result;
+    const char* options = std::getenv(name.c_str());
+    if (options == nullptr) { return result; }
+    std::istringstream words(options);
+    for (std::string option; words >> option;) {
+      result.push_back(option);
+    }
+    return result;
   }
 
   /// Standard codebook: workspace fragments always use `pq_bits=0`, `pq_len=0`.
