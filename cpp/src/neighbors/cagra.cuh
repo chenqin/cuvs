@@ -10,6 +10,7 @@
 #include "detail/cagra/cagra_build.cuh"
 #include "detail/cagra/cagra_merge.cuh"
 #include "detail/cagra/cagra_search.cuh"
+#include "detail/cagra/filter_expansion_choice.cuh"
 #include "detail/cagra/graph_core.cuh"
 
 #include <raft/core/device_mdspan.hpp>
@@ -418,6 +419,13 @@ void search_with_filtering(raft::resources const& res,
   RAFT_EXPECTS(queries.extent(1) == idx.dim(),
                "Number of query dimensions should equal number of dimensions in the index.");
 
+  // filter_expansion_mode::AUTO is resolved by cagra::search, which knows the filter type.
+  if (params.filter_expansion == filter_expansion_mode::AUTO) {
+    search_params params_copy    = params;
+    params_copy.filter_expansion = filter_expansion_mode::SCORE_ALL;
+    return cagra::detail::search_main<T, OutputIdxT, CagraSampleFilterT, IdxT, float, DatasetViewT>(
+      res, params_copy, idx, queries, neighbors, distances, sample_filter);
+  }
   return cagra::detail::search_main<T, OutputIdxT, CagraSampleFilterT, IdxT, float, DatasetViewT>(
     res, params, idx, queries, neighbors, distances, sample_filter);
 }
@@ -500,9 +508,27 @@ void search(raft::resources const& res,
       dynamic_cast<const cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>&>(
         sample_filter_ref);
     search_params params_copy = params;
+    if (params.filter_expansion == filter_expansion_mode::AUTO) {
+      RAFT_EXPECTS(
+        params.query_bitsets == nullptr,
+        "filter_expansion_mode::AUTO cannot be combined with search_params::query_bitsets; "
+        "use SCORE_ALL or PASSING_TWO_HOP.");
+      // The same launch counts the passing rows when SCORE_ALL needs the filtering rate.
+      const auto choice            = detail::choose_filter_expansion(res,
+                                                          idx.graph(),
+                                                          idx.source_indices(),
+                                                          sample_filter.bitset_view_,
+                                                          params.filtering_rate < 0.0);
+      params_copy.filter_expansion = choice.mode;
+      if (choice.mode == filter_expansion_mode::SCORE_ALL && choice.passing_rows >= 0) {
+        const auto total_rows      = static_cast<double>(idx.dataset().n_rows());
+        const double rate          = 1.0 - static_cast<double>(choice.passing_rows) / total_rows;
+        params_copy.filtering_rate = static_cast<float>(std::min(std::max(rate, 0.0), 0.999));
+      }
+    }
     resolve_filtered_search_algo(params_copy);
-    if (params.filtering_rate < 0.0) {
-      if (params.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
+    if (params_copy.filtering_rate < 0.0) {
+      if (params_copy.filter_expansion == filter_expansion_mode::PASSING_TWO_HOP) {
         // PASSING_TWO_HOP does not use the filtering rate (itopk_size is increased by it only
         // for SCORE_ALL), so the bits of the filter are not counted.
         params_copy.filtering_rate = 0.0;
@@ -524,6 +550,9 @@ void search(raft::resources const& res,
     auto& sample_filter =
       dynamic_cast<const cuvs::neighbors::filtering::bloom_filter&>(sample_filter_ref);
     search_params params_copy = params;
+    if (params.filter_expansion == filter_expansion_mode::AUTO) {
+      params_copy.filter_expansion = filter_expansion_mode::SCORE_ALL;
+    }
     resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0f) {
       auto const* bloom_filter_obj =
@@ -548,6 +577,9 @@ void search(raft::resources const& res,
                  "Roaring filter dataset_rows must equal the number of rows in the index.");
 
     search_params params_copy = params;
+    if (params.filter_expansion == filter_expansion_mode::AUTO) {
+      params_copy.filter_expansion = filter_expansion_mode::SCORE_ALL;
+    }
     resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0f) {
       params_copy.filtering_rate = sample_filter.filtering_rate();
@@ -562,6 +594,9 @@ void search(raft::resources const& res,
     auto& sample_filter =
       dynamic_cast<const cuvs::neighbors::filtering::udf_filter&>(sample_filter_ref);
     search_params params_copy = params;
+    if (params.filter_expansion == filter_expansion_mode::AUTO) {
+      params_copy.filter_expansion = filter_expansion_mode::SCORE_ALL;
+    }
     resolve_filtered_search_algo(params_copy);
     if (params.filtering_rate < 0.0) {
       const float min_filtering_rate = 0.0f;

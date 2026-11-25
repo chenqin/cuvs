@@ -958,6 +958,7 @@ In each iteration, a CAGRA search takes parent nodes from its internal top-k lis
 | --- | --- |
 | `SCORE_ALL` (default) | The distance is computed to every neighbor of a parent node, and each of them can become a parent node in turn. Filtered-out vectors are removed from the result. |
 | `PASSING_TWO_HOP` | The distance is computed only to vectors that pass the filter, and only those vectors are kept in the internal top-k list and become parent nodes. A filtered-out neighbor is used as a bridge: no distance is computed to it, and its own neighbors are examined instead. The child nodes of a parent node are its neighbors that pass the filter and the neighbors of its bridges that pass the filter, up to about `graph_degree` child nodes per parent node. |
+| `AUTO` | For a bitset filter, samples rows that pass the filter and counts their graph neighbors that pass it too. Uses `PASSING_TWO_HOP` when a passing row has at least 8 passing neighbors on average (the passing rows are close to each other in the graph) and `SCORE_ALL` otherwise, including filters whose passing rows are spread uniformly. The estimate costs one small kernel and one stream synchronization per search call. Other filter types use `SCORE_ALL`; `AUTO` cannot be combined with `query_bitsets`. |
 
 Only `MULTI_CTA` implements `PASSING_TWO_HOP`:
 
