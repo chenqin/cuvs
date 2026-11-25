@@ -80,6 +80,15 @@ enum class internal_dtype { F16 = 0, E5M2 = 1 };
  * much larger `itopk_size` than `SCORE_ALL` for the same recall. Use `SCORE_ALL` or an exact search
  * (`brute_force::search` with a bitset filter) for such filters.
  *
+ * - `AUTO`: For a `filtering::bitset_filter`, the search samples rows that pass the filter and
+ * counts their graph neighbors that pass it too. It uses `PASSING_TWO_HOP` when such a row has at
+ * least 8 passing neighbors on average, which means that the rows that pass are close to each
+ * other in the graph, and `SCORE_ALL` otherwise, which includes filters whose passing rows are
+ * spread uniformly over the dataset. The estimate costs one small kernel and one synchronization
+ * of the stream per search call, as counting the bits of the bitset for `filtering_rate` does.
+ * Other filter types, and bitsets without standard 32-bit packing, use `SCORE_ALL`. `AUTO` cannot
+ * be combined with `search_params::query_bitsets`.
+ *
  * Only the MULTI_CTA search algorithm implements `PASSING_TWO_HOP`. Multi-partition search always
  * uses `SCORE_ALL`.
  */
@@ -87,7 +96,10 @@ enum class filter_expansion_mode {
   /** Compute the distance to every neighbor of a parent node; remove filtered-out nodes. */
   SCORE_ALL = 0,
   /** Compute the distance only to nodes that pass the filter, reached through up to two hops. */
-  PASSING_TWO_HOP = 1
+  PASSING_TWO_HOP = 1,
+  /** Choose between SCORE_ALL and PASSING_TWO_HOP from a sample of the rows that pass the filter.
+   */
+  AUTO = 100
 };
 
 struct search_params : cuvs::neighbors::search_params {

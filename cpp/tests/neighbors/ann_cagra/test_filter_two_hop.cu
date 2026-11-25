@@ -7,6 +7,8 @@
 
 #include "../cagra_padded_build_helpers.cuh"
 
+#include "../../../src/neighbors/detail/cagra/filter_expansion_choice.cuh"
+
 #include <cuvs/core/bitset.hpp>
 #include <cuvs/core/bloom_filter.hpp>
 #include <cuvs/core/roaring_allowlist.hpp>
@@ -350,6 +352,77 @@ TEST_F(CagraFilterTwoHopTest, ScoreAllFindsFilteredNeighbors)
   params.max_iterations   = 0;
   const auto found        = search(params, 0);
   EXPECT_GE(filtered_recall(found, [](int64_t) { return 0; }), min_recall_score_all);
+}
+
+// filter_expansion_mode::AUTO samples rows that pass the filter and counts their graph neighbors
+// that pass it too. Filter 0 passes whole clusters, so a passing row's neighbors mostly pass, and
+// AUTO selects PASSING_TWO_HOP.
+TEST_F(CagraFilterTwoHopTest, AutoChoosesTwoHopForClusteredFilter)
+{
+  const auto view = filter(0).bitset_view_;
+  const auto estimate =
+    detail::estimate_passing_neighbors(res, index->graph(), index->source_indices(), view);
+  EXPECT_GE(estimate.samples, detail::kFilterExpansionMinSamples);
+  EXPECT_GE(estimate.mean_passing_neighbors, detail::kAutoTwoHopMinPassingNeighbors);
+  EXPECT_EQ(
+    detail::choose_filter_expansion(res, index->graph(), index->source_indices(), view).mode,
+    cagra::filter_expansion_mode::PASSING_TWO_HOP);
+}
+
+// A filter that passes each row with probability 1/10, independently of its cluster: a passing
+// row has about graph_degree / 10 passing neighbors, and AUTO selects SCORE_ALL.
+TEST_F(CagraFilterTwoHopTest, AutoChoosesScoreAllForUniformFilter)
+{
+  std::mt19937 gen(42);
+  std::vector<uint32_t> words((n_rows + 31) / 32, 0u);
+  for (int64_t i = 0; i < n_rows; i++) {
+    if (gen() % 10 == 0) { words[i / 32] |= 1u << (i % 32); }
+  }
+  int64_t passing = 0;
+  for (uint32_t w : words) {
+    passing += __builtin_popcount(w);
+  }
+  const int f     = add_filter(std::move(words));
+  const auto view = filter(f).bitset_view_;
+  const auto estimate =
+    detail::estimate_passing_neighbors(res, index->graph(), index->source_indices(), view, true);
+  EXPECT_GE(estimate.samples, detail::kFilterExpansionMinSamples);
+  EXPECT_LT(estimate.mean_passing_neighbors, detail::kAutoTwoHopMinPassingNeighbors);
+  // The same launch counts the passing rows exactly, for the filtering rate of SCORE_ALL.
+  EXPECT_EQ(estimate.passing_rows, passing);
+  EXPECT_EQ(
+    detail::choose_filter_expansion(res, index->graph(), index->source_indices(), view).mode,
+    cagra::filter_expansion_mode::SCORE_ALL);
+}
+
+// With too few passing rows to sample, AUTO selects SCORE_ALL.
+TEST_F(CagraFilterTwoHopTest, AutoChoosesScoreAllForNearlyEmptyFilter)
+{
+  std::vector<uint32_t> words((n_rows + 31) / 32, 0u);
+  words[0]    = 1u;
+  const int f = add_filter(std::move(words));
+  EXPECT_EQ(detail::choose_filter_expansion(
+              res, index->graph(), index->source_indices(), filter(f).bitset_view_)
+              .mode,
+            cagra::filter_expansion_mode::SCORE_ALL);
+}
+
+TEST_F(CagraFilterTwoHopTest, AutoFindsFilteredNeighbors)
+{
+  auto params             = two_hop_params();
+  params.algo             = cagra::search_algo::AUTO;
+  params.filter_expansion = cagra::filter_expansion_mode::AUTO;
+  const auto found        = search(params, 0);
+  EXPECT_GE(filtered_recall(found, [](int64_t) { return 0; }), min_recall_two_hop);
+}
+
+TEST_F(CagraFilterTwoHopTest, AutoRejectsQueryBitsets)
+{
+  auto pointers           = query_pointers([](int64_t q) { return static_cast<int>(q % 2); });
+  auto params             = two_hop_params();
+  params.filter_expansion = cagra::filter_expansion_mode::AUTO;
+  params.query_bitsets    = as_query_bitsets(pointers);
+  EXPECT_THROW(search(params, 0), raft::exception);
 }
 
 // In the second hop, the number of graph entries a thread reads per round depends on the thread
