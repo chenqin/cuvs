@@ -8,6 +8,7 @@
 #include "../cagra_padded_build_helpers.cuh"
 
 #include "../../../src/neighbors/detail/cagra/filter_expansion_choice.cuh"
+#include "../../../src/neighbors/detail/cagra/search_multi_cta_waves.hpp"
 
 #include <cuvs/core/bitset.hpp>
 #include <cuvs/core/bloom_filter.hpp>
@@ -345,6 +346,21 @@ TEST_F(CagraFilterTwoHopTest, FindsFilteredNeighbors)
   EXPECT_GE(filtered_recall(found, [](int64_t) { return 0; }), min_recall_two_hop);
 }
 
+// itopk_size 32 x (multiprocessors) gives as many thread blocks a query, and the 32 queries need 32
+// blocks on every multiprocessor: two waves of the small multi-CTA entry point's default variant
+// where a multiprocessor holds 24 (compute capability 8.0, 9.0 and 10.0), one of its resident
+// variant, which the launcher then selects (see search_multi_cta_resident_variant.hpp). The search
+// must still find the filtered neighbors; GPUs whose limits bind at the default cap run the default
+// variant.
+TEST_F(CagraFilterTwoHopTest, LargeGridFindsFilteredNeighbors)
+{
+  auto params = two_hop_params();
+  params.itopk_size =
+    32 * static_cast<size_t>(raft::resource::get_device_properties(res).multiProcessorCount);
+  const auto found = search(params, 0);
+  EXPECT_GE(filtered_recall(found, [](int64_t) { return 0; }), min_recall_two_hop);
+}
+
 TEST_F(CagraFilterTwoHopTest, ScoreAllFindsFilteredNeighbors)
 {
   auto params             = two_hop_params();
@@ -641,6 +657,34 @@ TEST_F(CagraFilterTwoHopTest, OtherAlgorithmsReturnOnlyPassingRows)
       if (row < n_rows) { EXPECT_TRUE(passes(0, row)) << "returned row " << row; }
     }
   }
+}
+
+// The launcher selects the resident variant of the small multi-CTA entry point only when it runs
+// the grid in fewer waves of thread blocks. The cases are the 64-query grids of itopk_size 1536 (48
+// blocks a query, 3,072 blocks) and 2048 (64 a query, 4,096), as in k = 300 and k = 1000
+// searches, on a B200 (148 multiprocessors, 24 blocks each with the default variant, 32 with the
+// resident variant) and on GPUs with fewer multiprocessors.
+TEST(CagraMultiCtaResidentVariant, PrefersFewerWaves)
+{
+  using cuvs::neighbors::cagra::detail::multi_cta_search::prefer_resident_variant;
+  using cuvs::neighbors::cagra::detail::multi_cta_search::waves_of_thread_blocks;
+  EXPECT_EQ(waves_of_thread_blocks(3072, 148, 24), 1u);
+  EXPECT_EQ(waves_of_thread_blocks(4096, 148, 24), 2u);
+  EXPECT_EQ(waves_of_thread_blocks(3553, 148, 24), 2u);
+  EXPECT_EQ(waves_of_thread_blocks(1, 148, 0), 0u);
+  EXPECT_FALSE(prefer_resident_variant(3072, 148, 24, 32));  // one wave either way
+  EXPECT_TRUE(prefer_resident_variant(4096, 148, 24, 32));   // two waves against one
+  EXPECT_TRUE(prefer_resident_variant(3072, 110, 24, 32));   // two against one
+  EXPECT_FALSE(prefer_resident_variant(3072, 84, 24, 32));   // two waves either way
+  EXPECT_TRUE(prefer_resident_variant(3072, 38, 24, 32));    // four against three
+  // Thread or shared memory limits that bind at the default cap: no block to gain.
+  EXPECT_FALSE(prefer_resident_variant(4096, 84, 23, 23));
+  // A resident variant that holds fewer blocks.
+  EXPECT_FALSE(prefer_resident_variant(4096, 84, 24, 20));
+  // No blocks for the default variant (the occupancy query failed): keep the default.
+  EXPECT_FALSE(prefer_resident_variant(4096, 148, 0, 32));
+  // An empty grid.
+  EXPECT_FALSE(prefer_resident_variant(0, 148, 24, 32));
 }
 
 }  // namespace

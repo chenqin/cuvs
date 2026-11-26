@@ -93,7 +93,8 @@ template <typename DataTag,
 std::shared_ptr<rtcx::algorithm_launcher> build_multi_cta_launcher(
   const dataset_descriptor_host<DataT, IndexT, DistanceT>& dataset_desc,
   std::unique_ptr<rtcx::udf_fatbin_fragment> sample_filter_udf_fragment,
-  bool small)
+  bool small,
+  bool resident)
 {
   multi_cta_search::CagraMultiCtaSearchPlanner<DataTag,
                                                IndexTag,
@@ -108,7 +109,8 @@ std::shared_ptr<rtcx::algorithm_launcher> build_multi_cta_launcher(
             dataset_desc.is_vpq,
             dataset_desc.pq_bits,
             dataset_desc.pq_len,
-            small);
+            small,
+            resident);
 
   if constexpr (std::is_same_v<CodebookTag, tag_codebook_half>) {
     planner.add_setup_workspace_device_function(dataset_desc.team_size,
@@ -393,7 +395,8 @@ std::shared_ptr<rtcx::algorithm_launcher> make_cagra_single_cta_jit_launcher(
 
 /// Build a JIT rtcx::algorithm_launcher for multi-CTA CAGRA search.
 /// `small` selects the `search_multi_cta_small` kernel entry point, which is used only for thread
-/// blocks of at most `kSmallBlockMaxThreads` threads.
+/// blocks of at most `kSmallBlockMaxThreads` threads, and `resident` its resident variant (the
+/// lower register cap kSmallResidentMaxRegisters).
 template <typename DataT,
           typename IndexT,
           typename DistanceT,
@@ -402,7 +405,8 @@ template <typename DataT,
 std::shared_ptr<rtcx::algorithm_launcher> make_cagra_multi_cta_jit_launcher(
   const dataset_descriptor_host<DataT, IndexT, DistanceT>& dataset_desc,
   std::unique_ptr<rtcx::udf_fatbin_fragment> sample_filter_udf_fragment = nullptr,
-  bool small                                                            = false)
+  bool small                                                            = false,
+  bool resident                                                         = false)
 {
   using DataTag   = decltype(get_data_type_tag<DataT>());
   using IndexTag  = decltype(get_index_type_tag<IndexT>());
@@ -423,7 +427,7 @@ std::shared_ptr<rtcx::algorithm_launcher> make_cagra_multi_cta_jit_launcher(
                                                                        IndexT,
                                                                        DistanceT,
                                                                        SourceIndexT>(
-      dataset_desc, std::move(sample_filter_udf_fragment), small);
+      dataset_desc, std::move(sample_filter_udf_fragment), small, resident);
   }
   using CodebookTag = codebook_tag_standard_t;
   if (dataset_desc.metric == cuvs::distance::DistanceType::BitwiseHamming) {
@@ -440,7 +444,7 @@ std::shared_ptr<rtcx::algorithm_launcher> make_cagra_multi_cta_jit_launcher(
                                                                        IndexT,
                                                                        DistanceT,
                                                                        SourceIndexT>(
-      dataset_desc, std::move(sample_filter_udf_fragment), small);
+      dataset_desc, std::move(sample_filter_udf_fragment), small, resident);
   }
   using QueryTag = query_type_tag_standard_t<DataTag, cuvs::distance::DistanceType::L2Expanded>;
   return cagra_jit_launcher_factory_detail::build_multi_cta_launcher<DataTag,
@@ -454,7 +458,7 @@ std::shared_ptr<rtcx::algorithm_launcher> make_cagra_multi_cta_jit_launcher(
                                                                      IndexT,
                                                                      DistanceT,
                                                                      SourceIndexT>(
-    dataset_desc, std::move(sample_filter_udf_fragment), small);
+    dataset_desc, std::move(sample_filter_udf_fragment), small, resident);
 }
 
 /// Build a JIT rtcx::algorithm_launcher for the multi-partition single-CTA CAGRA search.

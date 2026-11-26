@@ -120,6 +120,14 @@ inline constexpr std::uint32_t kSmallBlockMaxThreads = 256;
 /// without adding resident blocks, and the launcher does not select `search_multi_cta_small`.
 inline constexpr std::uint32_t kSmallBlockMinBlocksPerSm = 6;
 
+/// Register cap of the resident variant of `search_multi_cta_small`: the most registers a thread
+/// can have when 2,048 threads, the most a multiprocessor of compute capability 8.0, 9.0 or 10.0
+/// holds, share its 65,536 registers (65,536 / 2,048 = 32). Such a multiprocessor then holds 32
+/// blocks of 64 threads, against 24 at the default cap of 40. The launcher selects the variant per
+/// launch (see search_multi_cta_resident_variant.hpp).
+inline constexpr std::uint32_t kSmallResidentMaxRegisters = 65536u / 2048u;
+static_assert(kSmallResidentMaxRegisters == 32);
+
 template <typename DataT, typename IndexT, typename DistanceT, typename SourceIndexT>
 using search_multi_cta_mp_kernel_func_t =
   void(const multi_partition_desc_t<DataT, IndexT, DistanceT>*,

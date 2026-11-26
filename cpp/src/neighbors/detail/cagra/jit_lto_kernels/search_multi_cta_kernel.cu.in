@@ -22,11 +22,13 @@ namespace cuvs::neighbors::cagra::detail::multi_cta_search {
 
 // Neither entry point has __launch_bounds__: it would make nvJitLink ignore -maxrregcount. The
 // multi-CTA planner links search_multi_cta with -maxrregcount=64 (what __launch_bounds__(1024, 1)
-// allowed, so any block size up to 1024 launches) and search_multi_cta_small with the cap that
-// __launch_bounds__(kSmallBlockMaxThreads, kSmallBlockMinBlocksPerSm) allowed (40 registers),
-// unless CUVS_CAGRA_JIT_LINK_OPTIONS_search_multi_cta (both entry points) or
+// allowed, so any block size up to 1024 launches) and the search_multi_cta_small entry point with
+// the cap that __launch_bounds__(kSmallBlockMaxThreads, kSmallBlockMinBlocksPerSm) allowed (40
+// registers), unless CUVS_CAGRA_JIT_LINK_OPTIONS_search_multi_cta (both entry points) or
 // CUVS_CAGRA_JIT_LINK_OPTIONS_search_multi_cta_small sets another cap. A lower cap raises the
-// resident blocks per SM (64 registers x 128 threads limit an SM to 8 blocks).
+// resident blocks per SM (64 registers x 128 threads limit an SM to 8 blocks). The small entry
+// point is also linked with 32 registers, a resident variant that select_and_run() launches when
+// it runs the grid in fewer waves (see search_multi_cta_resident_variant.hpp).
 extern "C" __global__ void search_multi_cta(index_t* const result_indices_ptr,
                                             distance_t* const result_distances_ptr,
                                             const dataset_desc_base* dataset_desc,

@@ -15,6 +15,7 @@
 #include "jit_lto_kernels/kernel_def.hpp"
 #include "multi_partition_desc.hpp"
 #include "sample_filter_utils.cuh"  // For CagraSampleFilterWithQueryIdOffset
+#include "search_multi_cta_resident_variant.hpp"
 #include "search_plan.cuh"          // For search_params
 #include "set_value_batch.cuh"      // For set_value_batch
 #include "shared_launcher_jit.hpp"  // For shared JIT helper functions
@@ -131,17 +132,36 @@ void select_and_run(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dat
   set_multi_cta_filter_flags(filter_payload, sample_filter, ps);
   const uint32_t query_id_offset = filter_payload.query_id_offset;
 
-  std::shared_ptr<rtcx::algorithm_launcher> launcher =
-    make_cagra_multi_cta_jit_launcher<DataT,
-                                      IndexT,
-                                      DistanceT,
-                                      SourceIndexT,
-                                      sample_filter_jit_tag_t<SampleFilterT>>(
+  const bool small   = use_small_block_entry_point(block_size);
+  auto make_launcher = [&](bool resident) {
+    return make_cagra_multi_cta_jit_launcher<DataT,
+                                             IndexT,
+                                             DistanceT,
+                                             SourceIndexT,
+                                             sample_filter_jit_tag_t<SampleFilterT>>(
       dataset_desc,
       make_cagra_sample_filter_udf_fragment<SourceIndexT>(sample_filter),
-      /*small=*/use_small_block_entry_point(block_size));
+      small,
+      resident);
+  };
+  std::shared_ptr<rtcx::algorithm_launcher> launcher = make_launcher(/*resident=*/false);
 
   if (!launcher) { RAFT_FAIL("Failed to get JIT launcher"); }
+
+  // The small entry point has a resident variant with fewer registers per thread, so more thread
+  // blocks per multiprocessor (see search_multi_cta_resident_variant.hpp). It is used only when it
+  // runs the grid in fewer waves: a grid that the default variant already runs at once, the usual
+  // case for small batches and on GPUs with many multiprocessors, keeps the default variant and its
+  // fewer spills.
+  if (small && resident_variant_enabled()) {
+    auto resident_launcher = select_resident_launcher(
+      launcher,
+      [&] { return make_launcher(/*resident=*/true); },
+      static_cast<uint64_t>(num_cta_per_query) * num_queries,
+      block_size,
+      smem_size);
+    if (resident_launcher) { launcher = std::move(resident_launcher); }
+  }
 
   uint32_t max_elements{};
   if (result_buffer_size <= 64) {

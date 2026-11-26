@@ -27,20 +27,26 @@ struct CagraMultiCtaSearchPlanner
   : CagraPlannerBase<DataTag, IndexTag, DistanceTag, QueryTag, CodebookTag, SampleFilterJitTag> {
   static inline rtcx::launcher_jit_cache launcher_jit_cache{};
   static inline rtcx::launcher_jit_cache launcher_jit_cache_small{};
+  static inline rtcx::launcher_jit_cache launcher_jit_cache_small_resident{};
 
   /// `small` selects the `search_multi_cta_small` entry point, which is used only for thread blocks
-  /// of at most `kSmallBlockMaxThreads` threads. Each entry point has its own launcher cache: both
-  /// are linked from the same fragments, and a cache reuses the linked kernel for a fragment key.
+  /// of at most `kSmallBlockMaxThreads` threads; with `resident` as well, its resident variant,
+  /// linked with the lower register cap kSmallResidentMaxRegisters (see
+  /// search_multi_cta_resident_variant.hpp). Each entry point and variant has its own launcher
+  /// cache: they are linked from the same fragments, and a cache reuses the linked kernel for a
+  /// fragment key.
   CagraMultiCtaSearchPlanner(cuvs::distance::DistanceType /*metric*/,
                              uint32_t /*team_size*/,
                              uint32_t /*dataset_block_dim*/,
                              bool /*is_vpq*/,
                              uint32_t /*pq_bits*/,
                              uint32_t /*pq_len*/,
-                             bool small = false)
+                             bool small    = false,
+                             bool resident = false)
     : CagraPlannerBase<DataTag, IndexTag, DistanceTag, QueryTag, CodebookTag, SampleFilterJitTag>(
         small ? "search_multi_cta_small" : "search_multi_cta",
-        small ? launcher_jit_cache_small : launcher_jit_cache)
+        small ? (resident ? launcher_jit_cache_small_resident : launcher_jit_cache_small)
+              : launcher_jit_cache)
   {
     auto& options = this->linktime_extra_options;
     if (small) {
@@ -52,12 +58,14 @@ struct CagraMultiCtaSearchPlanner
     // Neither entry point has __launch_bounds__ (see search_multi_cta_kernel.cu.in), so the link
     // sets the register cap. The last -maxrregcount given wins. Without one, the cap is what launch
     // bounds would allow: 64 registers for blocks of up to 1,024 threads, and kSmallMaxRegisters
-    // for the small entry point.
+    // for the small entry point (kSmallResidentMaxRegisters for its resident variant, which the
+    // launcher does not select when the environment gives a cap).
     auto is_cap = [](const std::string& option) { return option.rfind("-maxrregcount", 0) == 0; };
     auto last   = std::find_if(options.rbegin(), options.rend(), is_cap);
     if (last == options.rend()) {
-      options.push_back(small ? "-maxrregcount=" + std::to_string(kSmallMaxRegisters)
-                              : std::string("-maxrregcount=64"));
+      uint32_t cap = 64;
+      if (small) { cap = resident ? kSmallResidentMaxRegisters : kSmallMaxRegisters; }
+      options.push_back("-maxrregcount=" + std::to_string(cap));
     } else {
       std::string cap = *last;
       options.erase(std::remove_if(options.begin(), options.end(), is_cap), options.end());
